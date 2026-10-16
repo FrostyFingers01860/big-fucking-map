@@ -1,0 +1,169 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>District terrain renderer</title>
+<canvas id="terrain"></canvas>
+<script>
+  const fs = require("fs");
+
+  window.renderTerrain = async (inputPath, outputPath, outputSize) => {
+    const source = JSON.parse(fs.readFileSync(inputPath, "utf8"));
+    const width = source.info.width;
+    const height = source.info.height;
+    if (!width || !height || width !== height) throw new Error("The FMG source map must be square");
+
+    const canvas = document.getElementById("terrain");
+    canvas.width = outputSize;
+    canvas.height = outputSize;
+    const context = canvas.getContext("2d", {alpha: false});
+    const scale = outputSize / width;
+    context.scale(scale, scale);
+    context.lineJoin = "round";
+    context.lineCap = "round";
+
+    const cells = source.pack.cells;
+    const vertices = source.pack.vertices;
+    const biomes = source.pack.biomes;
+    const cellById = new Map(cells.map(cell => [cell.i, cell]));
+
+    const colorCache = new Map();
+    const shadeColor = (hex, amount) => {
+      const key = `${hex}:${Math.round(amount)}`;
+      if (colorCache.has(key)) return colorCache.get(key);
+      const value = Number.parseInt(hex.replace("#", ""), 16);
+      const channel = shift => Math.max(0, Math.min(255, ((value >> shift) & 255) + amount));
+      const color = `rgb(${channel(16)},${channel(8)},${channel(0)})`;
+      colorCache.set(key, color);
+      return color;
+    };
+
+    const traceCell = cell => {
+      const ids = cell.v;
+      if (!ids?.length) return false;
+      const first = vertices[ids[0]]?.p;
+      if (!first) return false;
+      context.beginPath();
+      context.moveTo(first[0], first[1]);
+      for (let index = 1; index < ids.length; index++) {
+        const point = vertices[ids[index]]?.p;
+        if (point) context.lineTo(point[0], point[1]);
+      }
+      context.closePath();
+      return true;
+    };
+
+    // Biomes form the opaque base. Height values are baked into their color as
+    // subtle relief, retaining both layers without carrying the source graph.
+    context.fillStyle = biomes[0]?.color || "#466eab";
+    context.fillRect(0, 0, width, height);
+    for (const cell of cells) {
+      if (!traceCell(cell)) continue;
+      const base = biomes[cell.biome]?.color || (cell.h >= 20 ? "#9baa75" : "#466eab");
+      let shade;
+      if (cell.h < 20) {
+        shade = Math.round((cell.h - 14) * 1.6);
+      } else {
+        const neighbors = (cell.c || []).map(id => cellById.get(id)).filter(Boolean);
+        let slopeLight = 0;
+        for (const neighbor of neighbors) {
+          const dx = neighbor.p[0] - cell.p[0];
+          const dy = neighbor.p[1] - cell.p[1];
+          const distance2 = dx * dx + dy * dy || 1;
+          slopeLight += (neighbor.h - cell.h) * (dx + dy) / distance2;
+        }
+        shade = Math.round(Math.max(-18, Math.min(20,
+          (cell.h - 42) * 0.18 - slopeLight * 3.8)));
+      }
+      context.fillStyle = shadeColor(base, shade);
+      context.fill();
+    }
+
+    // Lakes come from feature outlines, so their clean shoreline survives even
+    // though all unrelated FMG feature data is discarded from the output.
+    const lakeColors = {
+      freshwater: "#4c91ad",
+      salt: "#5596a9",
+      sinkhole: "#397f9b",
+      frozen: "#c9e9ef",
+      lava: "#b94a2e",
+      dry: "#9a8a65"
+    };
+    for (const feature of source.pack.features) {
+      if (!feature || feature.type !== "lake" || !feature.vertices?.length) continue;
+      const first = vertices[feature.vertices[0]]?.p;
+      if (!first) continue;
+      context.beginPath();
+      context.moveTo(first[0], first[1]);
+      for (let index = 1; index < feature.vertices.length; index++) {
+        const point = vertices[feature.vertices[index]]?.p;
+        if (point) context.lineTo(point[0], point[1]);
+      }
+      context.closePath();
+      context.fillStyle = lakeColors[feature.group || feature.subtype] || lakeColors.freshwater;
+      context.fill();
+      context.strokeStyle = "rgba(207,235,239,.50)";
+      context.lineWidth = 0.42;
+      context.stroke();
+    }
+
+    // FMG's JSON export does not serialize free-floating iceberg geometry. Its
+    // Glacier biome is retained as the stable ice layer available in this file.
+    for (const cell of cells) {
+      if (cell.biome !== 11 || !traceCell(cell)) continue;
+      context.fillStyle = "rgba(225,245,248,.42)";
+      context.fill();
+    }
+
+    // Rivers are drawn last, matching FMG layer order and preserving visibility.
+    const drawRiver = (river, outline) => {
+      const points = (river.cells || []).map(id => cellById.get(id)?.p).filter(Boolean);
+      if (points.length < 2) return;
+      context.beginPath();
+      context.moveTo(points[0][0], points[0][1]);
+      for (let index = 1; index < points.length; index++) {
+        const current = points[index];
+        const previous = points[index - 1];
+        const midpointX = (previous[0] + current[0]) / 2;
+        const midpointY = (previous[1] + current[1]) / 2;
+        context.quadraticCurveTo(previous[0], previous[1], midpointX, midpointY);
+      }
+      const last = points[points.length - 1];
+      context.lineTo(last[0], last[1]);
+      const width = Math.max(0.42, Math.min(3.6, Math.sqrt(river.discharge || 30) * 0.055));
+      context.lineWidth = outline ? width + 0.8 : width;
+      context.strokeStyle = outline ? "rgba(24,66,82,.55)" : "rgba(91,177,207,.95)";
+      context.stroke();
+    };
+    for (const river of source.pack.rivers || []) drawRiver(river, true);
+    for (const river of source.pack.rivers || []) drawRiver(river, false);
+
+    // A restrained paper-like texture is the final retained visual layer.
+    let randomState = Number(source.info.seed) >>> 0;
+    const random = () => {
+      randomState = (1664525 * randomState + 1013904223) >>> 0;
+      return randomState / 4294967296;
+    };
+    context.save();
+    context.globalCompositeOperation = "soft-light";
+    for (let index = 0; index < 26000; index++) {
+      const light = random() > 0.48;
+      context.fillStyle = light ? "rgba(255,255,255,.055)" : "rgba(20,23,18,.045)";
+      const x = random() * width;
+      const y = random() * height;
+      const radius = 0.15 + random() * 1.35;
+      context.fillRect(x, y, radius, radius * (0.35 + random()));
+    }
+    context.restore();
+
+    const png = canvas.toDataURL("image/png").replace(/^data:image\/png;base64,/, "");
+    fs.writeFileSync(outputPath, Buffer.from(png, "base64"));
+    return {
+      source: inputPath,
+      output: outputPath,
+      size: outputSize,
+      seed: source.info.seed,
+      cells: cells.length,
+      rivers: source.pack.rivers?.length || 0,
+      retainedLayers: ["texture", "heightmap", "lakes", "biomes", "ice", "rivers"]
+    };
+  };
+</script>

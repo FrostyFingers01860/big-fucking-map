@@ -1,0 +1,261 @@
+// @vitest-environment jsdom
+import { describe, expect, it, vi } from "vitest";
+
+// fonts populates the font selector at import time, which needs the real app dom
+vi.mock("@/services/fonts", () => ({ getUsedFonts: vi.fn(), loadFontsAsDataURI: vi.fn() }));
+vi.mock("@/utils", async original => ({ ...(await original<typeof import("@/utils")>()), getBase64: vi.fn() }));
+
+import "@/generators/relief-generator"; // the models own the set namespaces a custom icon id is told apart from
+import "@/generators/burgs-generator";
+import "@/generators/goods-generator";
+import { flattenSymbolReferences, inlineLinkedImages, relocateRootFilter } from "./export";
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+function makeSymbolSvg(
+  symbolAttrs: Record<string, string>,
+  useAttrs: Record<string, string>,
+  groupAttrs: Record<string, string> = {}
+): SVGSVGElement {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  const defs = document.createElementNS(SVG_NS, "defs");
+  const symbol = document.createElementNS(SVG_NS, "symbol");
+  symbol.id = "icon-test";
+  for (const [key, value] of Object.entries(symbolAttrs)) symbol.setAttribute(key, value);
+  const circle = document.createElementNS(SVG_NS, "circle");
+  circle.setAttribute("r", "5");
+  symbol.appendChild(circle);
+  defs.appendChild(symbol);
+  svg.appendChild(defs);
+
+  const group = document.createElementNS(SVG_NS, "g");
+  for (const [key, value] of Object.entries(groupAttrs)) group.setAttribute(key, value);
+  const use = document.createElementNS(SVG_NS, "use");
+  use.setAttribute("href", "#icon-test");
+  for (const [key, value] of Object.entries(useAttrs)) use.setAttribute(key, value);
+  group.appendChild(use);
+  svg.appendChild(group);
+  return svg;
+}
+
+function makeSvg(rootFilter: string | null, withViewbox = true): SVGSVGElement {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  if (rootFilter) svg.setAttribute("filter", rootFilter);
+  const defs = document.createElementNS(SVG_NS, "defs");
+  for (const id of ["filter-tint", "dropShadow01"]) {
+    const filter = document.createElementNS(SVG_NS, "filter");
+    filter.id = id;
+    defs.appendChild(filter);
+  }
+  svg.appendChild(defs);
+  if (withViewbox) {
+    for (const id of ["viewbox", "scaleBar", "vignette", "legend"]) {
+      const group = document.createElementNS(SVG_NS, "g");
+      group.id = id;
+      svg.appendChild(group);
+    }
+  }
+  return svg;
+}
+
+describe("relocateRootFilter", () => {
+  it("filters the map and viewport overlays together without changing their order or transforms", () => {
+    const svg = makeSvg("url(#filter-tint)");
+    const viewbox = svg.querySelector("#viewbox")!;
+    viewbox.setAttribute("transform", "translate(20,-30) scale(0.5)");
+    const scaleBar = svg.querySelector("#scaleBar")!;
+    scaleBar.setAttribute("transform", "translate(700,500)");
+    relocateRootFilter(svg);
+    const wrapper = viewbox.parentElement!;
+    expect(svg.getAttribute("filter")).toBeNull();
+    expect(wrapper.parentElement).toBe(svg);
+    expect(wrapper.getAttribute("filter")).toBe("url(#filter-tint)");
+    expect(wrapper.hasAttribute("transform")).toBe(false);
+    expect(Array.from(wrapper.children, child => child.id)).toEqual(["viewbox", "scaleBar", "vignette", "legend"]);
+    expect(viewbox.getAttribute("transform")).toBe("translate(20,-30) scale(0.5)");
+    expect(scaleBar.getAttribute("transform")).toBe("translate(700,500)");
+    expect(viewbox.hasAttribute("filter")).toBe(false);
+    expect(scaleBar.hasAttribute("filter")).toBe(false);
+  });
+
+  it("preserves filter definitions and existing layer filters", () => {
+    const svg = makeSvg("url(#filter-tint)");
+    const defs = svg.querySelector("defs")!;
+    const shadow = svg.querySelector("#dropShadow01")!;
+    shadow.setAttribute("x", "-20%");
+    shadow.setAttribute("width", "140%");
+    const definitions = defs.outerHTML;
+    svg.querySelector("#scaleBar")!.setAttribute("filter", "url(#dropShadow01)");
+    relocateRootFilter(svg);
+    expect(defs.parentElement).toBe(svg);
+    expect(defs.outerHTML).toBe(definitions);
+    expect(svg.querySelector("#scaleBar")?.getAttribute("filter")).toBe("url(#dropShadow01)");
+  });
+
+  it("does not wrap or apply the filter twice", () => {
+    const svg = makeSvg("url(#filter-tint)");
+    relocateRootFilter(svg);
+    const once = svg.outerHTML;
+    relocateRootFilter(svg);
+    expect(svg.outerHTML).toBe(once);
+  });
+
+  it("leaves other filters untouched when the root svg has no filter", () => {
+    const svg = makeSvg(null);
+    relocateRootFilter(svg);
+    expect(svg.querySelector("#dropShadow01")?.getAttribute("filterUnits")).toBeNull();
+  });
+
+  it("does nothing when the root svg has no filter", () => {
+    const svg = makeSvg(null);
+    relocateRootFilter(svg);
+    expect(svg.getAttribute("filter")).toBeNull();
+    expect(svg.querySelector("#viewbox")?.getAttribute("filter")).toBeNull();
+  });
+
+  it("keeps the root filter when there is no #viewbox to move it to", () => {
+    const svg = makeSvg("url(#filter-tint)", false);
+    relocateRootFilter(svg);
+    expect(svg.getAttribute("filter")).toBe("url(#filter-tint)");
+  });
+});
+
+describe("flattenSymbolReferences", () => {
+  const iconSymbol = { viewBox: "0 0 10 10", width: "1em", height: "1em", overflow: "visible" };
+
+  it("preserves a cropped custom icon's viewport for differently sized uses", () => {
+    const svg = makeSymbolSvg({ viewBox: "25 25 50 50" }, { x: "100", y: "100", width: "20", height: "20" });
+    const symbol = svg.querySelector("symbol")!;
+    symbol.innerHTML = '<rect width="100" height="100"/>';
+    const second = svg.querySelector("use")!.cloneNode(true) as SVGUseElement;
+    second.setAttribute("width", "40");
+    second.setAttribute("height", "40");
+    svg.append(second);
+
+    flattenSymbolReferences(svg);
+
+    const clipped = svg.querySelector("[clip-path]")!;
+    expect(clipped).not.toBeNull();
+    const clipId = clipped.getAttribute("clip-path")!.slice(5, -1);
+    const rect = svg.getElementById(clipId)!.querySelector("rect")!;
+    expect(["x", "y", "width", "height"].map(attr => rect.getAttribute(attr))).toEqual(["25", "25", "50", "50"]);
+    expect([...svg.querySelectorAll("use")].map(use => use.getAttribute("transform"))).toEqual([
+      "translate(90,90) scale(0.4)",
+      "translate(80,80) scale(0.8)"
+    ]);
+    expect(clipped.querySelector('rect[width="100"]')).not.toBeNull();
+  });
+
+  it("keeps overflowing anchored art unclipped", () => {
+    const svg = makeSymbolSvg(iconSymbol, { width: "20", height: "20" });
+    flattenSymbolReferences(svg);
+    expect(svg.querySelector("clipPath")).toBeNull();
+  });
+
+  it("converts an em-sized symbol use into a transform scaled by the group font-size", () => {
+    const svg = makeSymbolSvg(iconSymbol, { x: "100", y: "50" }, { "font-size": "4" });
+    flattenSymbolReferences(svg);
+    const use = svg.querySelector("use")!;
+    expect(use.getAttribute("transform")).toBe("translate(100,50) scale(0.4)");
+    expect(use.getAttribute("x")).toBeNull();
+    expect(use.getAttribute("y")).toBeNull();
+  });
+
+  it("resolves the em size from an inlined font shorthand style", () => {
+    const svg = makeSymbolSvg(iconSymbol, { x: "10", y: "10" }, { style: 'font:0.5px "Times New Roman";' });
+    flattenSymbolReferences(svg);
+    expect(svg.querySelector("use")!.getAttribute("transform")).toBe("translate(10,10) scale(0.05)");
+  });
+
+  it.each([
+    [{ "font-size": "3%" }, "0.15"],
+    [{ "font-size": "3%", style: "font-size: 2px" }, "0.2"],
+    [{ style: "font-size: 6%" }, "0.3"]
+  ])("resolves relative icon font sizes against the zoomed layer: %j", (attrs, scale) => {
+    const svg = makeSymbolSvg(iconSymbol, {}, attrs);
+    svg.setAttribute("font-size", "50px");
+
+    flattenSymbolReferences(svg);
+
+    expect(svg.querySelector("use")!.getAttribute("transform")).toBe(`translate(0,0) scale(${scale})`);
+  });
+
+  it("replaces the symbol with a plain group without sizing attributes", () => {
+    const svg = makeSymbolSvg(iconSymbol, { x: "0", y: "0" }, { "font-size": "4" });
+    flattenSymbolReferences(svg);
+    expect(svg.querySelector("symbol")).toBeNull();
+    const g = svg.querySelector("defs > g#icon-test")!;
+    expect(g.getAttribute("viewBox")).toBeNull();
+    expect(g.getAttribute("width")).toBeNull();
+    expect(g.querySelector("circle")).not.toBeNull();
+  });
+
+  it("uses explicit width and height from the use element when present", () => {
+    const svg = makeSymbolSvg({ viewBox: "0 0 100 100" }, { x: "10", y: "20", width: "30", height: "30" });
+    flattenSymbolReferences(svg);
+    const use = svg.querySelector("use")!;
+    expect(use.getAttribute("transform")).toBe("translate(10,20) scale(0.3)");
+    expect(use.getAttribute("width")).toBeNull();
+    expect(use.getAttribute("height")).toBeNull();
+  });
+
+  it("offsets the translation for a viewBox with a nonzero origin", () => {
+    const svg = makeSymbolSvg({ viewBox: "-3 -8 65 80" }, { x: "0", y: "0", width: "65", height: "80" });
+    flattenSymbolReferences(svg);
+    expect(svg.querySelector("use")!.getAttribute("transform")).toBe("translate(3,8) scale(1)");
+  });
+
+  it("centers content with uniform scale when aspect ratios differ", () => {
+    const svg = makeSymbolSvg({ viewBox: "0 0 10 20" }, { x: "0", y: "0", width: "10", height: "10" });
+    flattenSymbolReferences(svg);
+    expect(svg.querySelector("use")!.getAttribute("transform")).toBe("translate(2.5,0) scale(0.5)");
+  });
+
+  it("keeps presentation attributes on the converted symbol", () => {
+    const svg = makeSymbolSvg(
+      { ...iconSymbol, stroke: "#000", "stroke-width": "14" },
+      { x: "0", y: "0" },
+      { "font-size": "4" }
+    );
+    flattenSymbolReferences(svg);
+    const g = svg.querySelector("defs > g#icon-test")!;
+    expect(g.getAttribute("stroke")).toBe("#000");
+    expect(g.getAttribute("stroke-width")).toBe("14");
+  });
+
+  it("ignores uses that reference non-symbol elements", () => {
+    const svg = document.createElementNS(SVG_NS, "svg");
+    const path = document.createElementNS(SVG_NS, "path");
+    path.id = "feature_1";
+    svg.appendChild(path);
+    const use = document.createElementNS(SVG_NS, "use");
+    use.setAttribute("href", "#feature_1");
+    use.setAttribute("x", "5");
+    svg.appendChild(use);
+    flattenSymbolReferences(svg);
+    expect(use.getAttribute("x")).toBe("5");
+    expect(use.getAttribute("transform")).toBeNull();
+  });
+});
+
+describe("inlineLinkedImages", () => {
+  it("inlines linked custom icons the host serves and drops those it does not, leaving other images alone", async () => {
+    const { getBase64 } = await import("@/utils");
+    const svg = document.createElementNS(SVG_NS, "svg");
+    svg.innerHTML = `<defs>
+        <symbol id="custom-a"><image href="https://ok.test/a.png"/></symbol>
+        <symbol id="custom-b"><image href="https://blocked.test/b.png"/></symbol>
+        <symbol id="custom-c"><image href="data:image/png;base64,AAAA"/></symbol>
+        <symbol id="goods-wood"><image href="https://ok.test/a.png"/></symbol>
+      </defs>`;
+    vi.mocked(getBase64).mockImplementation((url, callback) =>
+      callback(url.startsWith("https://ok") ? "data:image/png;base64,OK" : null)
+    );
+
+    await inlineLinkedImages(svg);
+    expect(svg.querySelector("#custom-a image")?.getAttribute("href")).toBe("data:image/png;base64,OK");
+    expect(svg.querySelector("#custom-b image")).toBeNull();
+    expect(svg.querySelector("#custom-c image")?.getAttribute("href")).toBe("data:image/png;base64,AAAA");
+    expect(svg.querySelector("#goods-wood image")?.getAttribute("href")).toBe("https://ok.test/a.png");
+  });
+});

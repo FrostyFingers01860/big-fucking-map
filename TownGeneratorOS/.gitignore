@@ -1,0 +1,10 @@
+.project
+*.iml
+/Export
+/.idea
+
+# Local, portable build toolchain and outputs
+.tools/
+.haxelib/
+# App/ is intentionally versioned in the Big Map bundle so non-technical users
+# can run the modified Windows build without installing the Haxe toolchain.

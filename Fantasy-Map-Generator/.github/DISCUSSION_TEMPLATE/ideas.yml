@@ -1,0 +1,38 @@
+body:
+  - type: markdown
+    attributes:
+      value: Before posting, search existing ideas and issues and upvote an existing idea instead of duplicating it. Votes help maintainers assess demand; they do not guarantee implementation. See the [reporting guide](https://github.com/Azgaar/Fantasy-Map-Generator/wiki/Reporting-bugs-and-ideas) for examples.
+  - type: textarea
+    id: idea
+    attributes:
+      label: The idea
+      description: What should the generator do?
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: What problem does it solve, or what does it make possible?
+  - type: dropdown
+    id: theme
+    attributes:
+      label: Theme
+      description: Which part of the generator is this about?
+      options:
+        - Not sure
+        - States / Provinces / Diplomacy
+        - Import / Export / Save
+        - UI / Editors
+        - Cultures / Religions / Society
+        - Burgs & Population
+        - Labels & Styling
+        - Climate / Biomes / Terrain
+        - Markers / Notes / Zones
+        - Military
+        - Rivers / Lakes / Coast
+        - Integrations & External
+        - Architecture / Performance
+        - Routes & Roads
+    validations:
+      required: true

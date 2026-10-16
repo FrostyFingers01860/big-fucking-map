@@ -1,0 +1,54 @@
+name: Theme label
+
+on:
+  issues:
+    types: [opened]
+  discussion:
+    types: [created]
+
+permissions:
+  issues: write
+  discussions: write
+  contents: read
+
+jobs:
+  theme:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            let classifyTheme;
+            try {
+              ({ classifyTheme } = await import(`${process.env.GITHUB_WORKSPACE}/scripts/theme-classify.mjs`));
+            } catch (error) {
+              core.warning(`theme classifier could not be loaded, applying needs-theme: ${error.message}`);
+              classifyTheme = () => "needs-theme";
+            }
+
+            const isDiscussion = !!context.payload.discussion;
+            const target = context.payload.discussion || context.payload.issue;
+            const existing = (target.labels || []).map(l => (typeof l === "string" ? l : l.name));
+            if (existing.some(l => l.startsWith("theme:"))) return;
+
+            const apply = classifyTheme(target.title, target.body);
+            if (isDiscussion) {
+              const q = await github.graphql(
+                `query($owner:String!,$repo:String!,$name:String!){repository(owner:$owner,name:$repo){label(name:$name){id}}}`,
+                { owner: context.repo.owner, repo: context.repo.repo, name: apply }
+              );
+              const labelId = q.repository.label && q.repository.label.id;
+              if (!labelId) return core.warning(`label not found: ${apply}`);
+              await github.graphql(
+                `mutation($l:ID!,$ids:[ID!]!){addLabelsToLabelable(input:{labelableId:$l,labelIds:$ids}){clientMutationId}}`,
+                { l: target.node_id, ids: [labelId] }
+              );
+            } else {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: target.number,
+                labels: [apply]
+              });
+            }

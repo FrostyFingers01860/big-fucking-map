@@ -1,0 +1,726 @@
+import { select } from "d3";
+import { fitMapToScreen } from "@/components/canvas";
+import { closeDialogs } from "@/components/dialog/dialog-helpers";
+import { Icons } from "@/components/icons";
+import { Layers } from "@/components/layers";
+import { registerMap } from "@/components/lifecycle";
+import { pickMapFile } from "@/components/options/io-panes";
+import { syncOptionInputs } from "@/components/options/tabs/options-tab";
+import { applyPerformanceSettings } from "@/components/performance";
+import { clearMainTip, tip } from "@/components/tooltips";
+import { undraw } from "@/components/undraw";
+import { applyDefaultViewboxEvents } from "@/components/viewbox-events";
+import { resetZoom } from "@/components/zoom";
+import { Controllers } from "@/controllers";
+import { GraphOverride } from "@/generators/graph-override";
+import { Styles } from "@/generators/styles";
+import { onLegendClick } from "@/renderers/draw-legend";
+import { applyVignetteOptions } from "@/renderers/draw-vignette";
+import { zonesFilter } from "@/renderers/draw-zones";
+import { HeightmapColorSchemes } from "@/renderers/heightmap-color-schemes";
+import { Services } from "@/services";
+import { declareFont } from "@/services/fonts";
+import { logStats } from "@/services/logging";
+import { clearCache, compareVersions, isValidVersion, parseMapVersion, VERSION } from "@/services/versioning";
+import { ensureEl, escapeHtml, last, link, parseError, rn, safeParseJSON } from "@/utils";
+
+async function quickLoad(): Promise<void> {
+  const blob = await ldb.get("lastMap");
+  if (blob) loadMapPrompt(blob);
+  else {
+    tip("No map stored. Save map to browser storage first", true, "error", 2000);
+    ERROR && console.error("No map stored");
+  }
+}
+
+async function loadFromDropbox(): Promise<void> {
+  const mapPath = ensureEl<HTMLInputElement>("loadFromDropboxSelect").value;
+
+  console.info("Loading map from Dropbox:", mapPath);
+  const blob = await Services.Cloud.load(mapPath);
+  uploadMap(blob);
+}
+
+async function createSharableDropboxLink(): Promise<void> {
+  const mapFile = (document.querySelector("#loadFromDropbox select") as HTMLSelectElement).value;
+  const sharableLink = ensureEl("sharableLink");
+  const sharableLinkContainer = ensureEl("sharableLinkContainer");
+
+  try {
+    const previewLink = await Services.Cloud.getLink(mapFile);
+    const directLink = previewLink.replace("www.dropbox.com", "dl.dropboxusercontent.com"); // DL allows CORS
+    const finalLink = `${location.origin}${location.pathname}?maplink=${directLink}`;
+
+    sharableLink.innerText = `${finalLink.slice(0, 45)}...`;
+    sharableLink.setAttribute("href", finalLink);
+    sharableLinkContainer.style.display = "block";
+  } catch (error) {
+    ERROR && console.error(error);
+    return tip("Dropbox API error. Can not create link.", true, "error", 2000);
+  }
+}
+
+function loadMapPrompt(blob: Blob): void {
+  const current = mapHistory.at(-1);
+  const workingTime = current ? (Date.now() - current.registeredAt) / 60000 : 0; // minutes
+  if (workingTime < 5) {
+    loadLastSavedMap();
+    return;
+  }
+
+  alertMessage.innerHTML = /* html */ `Are you sure you want to load saved map?<br />
+    All unsaved changes made to the current map will be lost`;
+  $("#alert").dialog({
+    resizable: false,
+    title: "Load saved map",
+    buttons: {
+      Cancel: function (this: HTMLElement) {
+        $(this).dialog("close");
+      },
+      Load: function (this: HTMLElement) {
+        loadLastSavedMap();
+        $(this).dialog("close");
+      }
+    }
+  });
+
+  function loadLastSavedMap() {
+    WARN && console.warn("Load last saved map");
+    try {
+      uploadMap(blob);
+    } catch (error) {
+      ERROR && console.error(error);
+      tip("Cannot load last saved map", true, "error", 2000);
+    }
+  }
+}
+
+async function loadMapFromURL(maplink: string, random?: boolean): Promise<void> {
+  const controller = new AbortController();
+  const TIMEOUT = 120000; // 120 seconds
+  const timeoutId = setTimeout(() => controller.abort(), TIMEOUT);
+
+  try {
+    const url = decodeURIComponent(maplink);
+    const response = await fetch(url, { method: "GET", mode: "cors", signal: controller.signal });
+    if (!response.ok) throw new Error("Cannot load map from URL");
+
+    const blob = await response.blob();
+    uploadMap(blob);
+  } catch (error) {
+    const message =
+      (error as Error)?.name === "AbortError"
+        ? "Cannot load map from URL: request timed out"
+        : (error as Error).message;
+    showUploadErrorMessage(message, maplink, random);
+    if (random) generateMapOnLoad();
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+function showUploadErrorMessage(error: string, maplink: string, random?: boolean): void {
+  ERROR && console.error(error);
+  alertMessage.innerHTML = /* html */ `Cannot load map from the ${link(maplink, "link provided")}. ${
+    random ? `A new random map is generated. ` : ""
+  } Please ensure the
+  linked file is reachable and CORS is allowed on server side`;
+  $("#alert").dialog({
+    title: "Loading error",
+    width: "32em",
+    buttons: {
+      "Clear cache": () => clearCache(),
+      OK: function (this: HTMLElement) {
+        $(this).dialog("close");
+      }
+    }
+  });
+}
+
+let uploadTimeStart = 0;
+
+function uploadMap(file: Blob, callback?: () => void): void {
+  uploadTimeStart = performance.now();
+
+  const fileReader = new FileReader();
+  fileReader.onloadend = async fileLoadedEvent => {
+    if (callback) callback();
+    ensureEl("coas").innerHTML = ""; // remove auto-generated emblems
+
+    const result = fileLoadedEvent.target!.result as ArrayBuffer;
+    const { mapData, mapVersion } = await parseLoadedResult(result);
+
+    const isInvalid = !mapData || !isValidVersion(mapVersion!) || mapData.length < 10 || !mapData[5];
+    if (isInvalid) return showUploadMessage("invalid", mapData, mapVersion);
+
+    const isUpdated = compareVersions(mapVersion!, VERSION).isEqual;
+    if (isUpdated) return showUploadMessage("updated", mapData, mapVersion);
+
+    const isAncient = compareVersions(mapVersion!, "0.70.0").isOlder;
+    if (isAncient) return showUploadMessage("ancient", mapData, mapVersion);
+
+    const isNewer = compareVersions(mapVersion!, VERSION).isNewer;
+    if (isNewer) return showUploadMessage("newer", mapData, mapVersion);
+
+    const isOutdated = compareVersions(mapVersion!, VERSION).isOlder;
+    if (isOutdated) return showUploadMessage("outdated", mapData, mapVersion);
+  };
+
+  fileReader.readAsArrayBuffer(file);
+}
+
+async function uncompress(compressedData: ArrayBuffer): Promise<Uint8Array | null> {
+  try {
+    const uncompressedStream = new Blob([compressedData]).stream().pipeThrough(new DecompressionStream("gzip"));
+
+    let uncompressedData: number[] = [];
+    for await (const chunk of uncompressedStream) {
+      uncompressedData = uncompressedData.concat(Array.from(chunk));
+    }
+
+    return new Uint8Array(uncompressedData);
+  } catch (error) {
+    ERROR && console.error(error);
+    return null;
+  }
+}
+
+async function parseLoadedResult(
+  result: ArrayBuffer | Uint8Array
+): Promise<{ mapData: string[] | null; mapVersion: string | null }> {
+  try {
+    const resultAsString = new TextDecoder().decode(result);
+
+    // data can be in FMG internal format or base64 encoded
+    const isDelimited = resultAsString.substring(0, 10).includes("|");
+    let content = isDelimited ? resultAsString : decodeURIComponent(atob(resultAsString));
+
+    // fix if svg part has CRLF line endings instead of LF
+    const svgMatch = content.match(/<svg[^>]*id="map"[\s\S]*?<\/svg>/);
+    const svgContent = svgMatch![0];
+    const hasCrlfEndings = svgContent.includes("\r\n");
+    if (hasCrlfEndings) {
+      const correctedSvgContent = svgContent.replace(/\r\n/g, "\n");
+      content = content.replace(svgContent, correctedSvgContent);
+    }
+
+    const mapData = content.split("\r\n"); // split by CRLF
+    const mapVersion = parseMapVersion(mapData[0].split("|")[0] || mapData[0] || "");
+
+    return { mapData, mapVersion };
+  } catch (error) {
+    const uncompressedData = await uncompress(result as ArrayBuffer); // file can be gzip compressed
+    if (uncompressedData) return parseLoadedResult(uncompressedData);
+
+    ERROR && console.error(error);
+    return { mapData: null, mapVersion: null };
+  }
+}
+
+function showUploadMessage(type: string, mapData: string[] | null, mapVersion: string | null): void {
+  let message = "";
+  let title = "";
+
+  if (type === "invalid") {
+    message = "The file does not look like a valid save file.<br>Please check the data format";
+    title = "Invalid file";
+  } else if (type === "updated") {
+    parseLoadedData(mapData!, mapVersion);
+    return;
+  } else if (type === "ancient") {
+    const archive = link("https://github.com/Azgaar/Fantasy-Map-Generator/wiki/Changelog", "archived version");
+    message = `The map version you are trying to load (${mapVersion}) is too old and cannot be updated to the current version.<br>Please keep using an ${archive}`;
+    title = "Ancient file";
+  } else if (type === "newer") {
+    message = `The map version you are trying to load (${mapVersion}) is newer than the current version.<br>Please load the file in the appropriate version`;
+    title = "Newer file";
+  } else if (type === "outdated") {
+    INFO && console.info(`Loading map. Auto-updating from ${mapVersion} to ${VERSION}`);
+    parseLoadedData(mapData!, mapVersion);
+    return;
+  }
+
+  alertMessage.innerHTML = message;
+  $("#alert").dialog({
+    title,
+    buttons: {
+      "Clear cache": () => clearCache(),
+      OK: function (this: HTMLElement) {
+        $(this).dialog("close");
+      }
+    }
+  });
+}
+
+async function parseLoadedData(data: string[], mapVersion: string | null): Promise<void> {
+  let isLogGroupOpen = false;
+
+  try {
+    const { migrateLegacySettings, resolveVersionConflicts } = await import("./auto-update"); // TODO: don't load if not required
+
+    closeDialogs();
+    customization = 0;
+    if (ensureEl("customizationMenu").offsetParent) ensureEl("styleTab").click();
+
+    migrateLegacySettings(mapVersion!, data);
+    const settings = data[1] ? safeParseJSON(data[1]) : null;
+    if (!settings) throw new Error("Map settings are missing or malformed");
+    Options.applyLoaded(settings);
+    syncOptionInputs();
+    await Controllers.StylePresetsEditor.init(); // the preset row follows the loaded map
+
+    INFO && console.group(options.map.seed ? `Loaded Map ${options.map.seed}` : "Loaded Map");
+    isLogGroupOpen = true;
+
+    if (data[34]) {
+      const usedFonts = JSON.parse(data[34]);
+      usedFonts.forEach((usedFont: (typeof fonts)[number]) => {
+        const { family: usedFamily, unicodeRange: usedRange, variant: usedVariant } = usedFont;
+        const defaultFont = fonts.find(
+          ({ family, unicodeRange, variant }) =>
+            family === usedFamily && unicodeRange === usedRange && variant === usedVariant
+        );
+        if (!defaultFont) fonts.push(usedFont);
+        declareFont(usedFont);
+      });
+    }
+
+    undraw(); // every layer releases its scene and content before the loaded map takes over
+    select("#map").remove();
+    document.body.insertAdjacentHTML("afterbegin", data[5]);
+    ensureEl("map").dataset.layer = "map"; // pre-1.154 maps lack it, and styles address the root by it
+    zonesFilter.type = "all"; // the dropped map's zone types say nothing about the loaded one
+
+    // TODO: check if we need it or if LayersRegistry resolves it automatically?
+    const viewbox = select("#viewbox");
+    if (!select("#texture").size()) {
+      viewbox.insert("g", "#landmass").attr("id", "texture").attr("data-href", "./images/textures/plaster.jpg");
+    }
+    if (!select("#emblems").size()) {
+      viewbox.insert("g", "#labels").attr("id", "emblems").style("display", "none");
+    }
+    grid = JSON.parse(data[6]);
+    Grid.rebuildGraph(grid);
+    GraphOverride.clear(); // the loaded world replaces the previous one
+    HeightmapGenerator.clearData(); // the generator must not pin the replaced grid
+    grid.cells.h = Uint8Array.from(data[7].split(","), Number);
+    grid.cells.prec = Uint8Array.from(data[8].split(","), Number);
+    grid.cells.f = Uint16Array.from(data[9].split(","), Number);
+    grid.cells.t = Int8Array.from(data[10].split(","), Number);
+    grid.cells.temp = Int8Array.from(data[11].split(","), Number);
+    Pack.generate();
+    Features.markupPack();
+    if (data[3]?.startsWith("[")) {
+      type LoadedBiome = (typeof pack.biomes)[number] & {
+        cells?: number;
+        area?: number;
+        rural?: number;
+        urban?: number;
+      };
+      const loadedBiomes: LoadedBiome[] = JSON.parse(data[3]);
+      for (const biome of loadedBiomes) {
+        delete biome.cells;
+        delete biome.area;
+        delete biome.rural;
+        delete biome.urban;
+      }
+      pack.biomes = loadedBiomes;
+    } else {
+      pack.biomes = [];
+    }
+    pack.features = JSON.parse(data[12]);
+    pack.cultures = JSON.parse(data[13]);
+    pack.states = JSON.parse(data[14]);
+    pack.burgs = JSON.parse(data[15]);
+    pack.religions = data[29] ? JSON.parse(data[29]) : ([{ i: 0, name: "No religion" }] as typeof pack.religions);
+    pack.provinces = data[30] ? JSON.parse(data[30]) : ([0] as unknown as typeof pack.provinces);
+    pack.rivers = data[32] ? JSON.parse(data[32]) : [];
+    pack.markers = data[35] ? JSON.parse(data[35]) : [];
+    pack.routes = data[37] ? JSON.parse(data[37]) : [];
+    pack.zones = data[38] ? JSON.parse(data[38]) : [];
+    pack.cells.biome = Uint8Array.from(data[16].split(","), Number);
+    pack.cells.burg = Uint16Array.from(data[17].split(","), Number);
+    pack.cells.conf = Uint8Array.from(data[18].split(","), Number);
+    pack.cells.culture = Uint16Array.from(data[19].split(","), Number);
+    pack.cells.fl = Uint16Array.from(data[20].split(","), Number);
+    pack.cells.pop = Float32Array.from(data[21].split(","), Number);
+    pack.cells.r = Uint16Array.from(data[22].split(","), Number);
+    // data[23] had deprecated cells.road
+    pack.cells.s = Uint16Array.from(data[24].split(","), Number);
+    pack.cells.state = Uint16Array.from(data[25].split(","), Number);
+    pack.cells.religion = data[26]
+      ? Uint16Array.from(data[26].split(","), Number)
+      : new Uint16Array(pack.cells.i.length);
+    pack.cells.province = data[27]
+      ? Uint16Array.from(data[27].split(","), Number)
+      : new Uint16Array(pack.cells.i.length);
+    // data[28] had deprecated cells.crossroad
+    // data[33] had deprecated rulers, now replaced by pack.measurers
+    pack.cells.routes = data[36] ? JSON.parse(data[36]) : {};
+    pack.ice = data[39] ? JSON.parse(data[39]) : [];
+    pack.cells.good = data[40] ? Uint16Array.from(data[40].split(","), Number) : new Uint16Array(pack.cells.i.length);
+    pack.goods = data[41] ? JSON.parse(data[41]) : [];
+    pack.markets = data[42] ? JSON.parse(data[42]) : [];
+    pack.deals = data[43] ? JSON.parse(data[43]) : [];
+    pack.cells.market = data[44] ? Uint16Array.from(data[44].split(","), Number) : new Uint16Array(pack.cells.i.length);
+    pack.measurers = data[46] ? JSON.parse(data[46]) : [];
+    pack.addedLabels = data[47] ? JSON.parse(data[47]) : [];
+    pack.relief = data[49] ? JSON.parse(data[49]) : [];
+    pack.journeys = data[52] ? JSON.parse(data[52]) : [];
+
+    // save omits names that equal the default base at the same index
+    const defaultNameBases = Names.getNameBases();
+    Names.nameBases = data[31]
+      ? data[31].split("/").map((d, i) => {
+          const e = d.split("|");
+          const b = e[5].split(",").length > 2 || !defaultNameBases[i] ? e[5] : defaultNameBases[i].b;
+          return { name: e[0], i, min: +e[1], max: +e[2], d: e[3], m: +e[4], b };
+        })
+      : defaultNameBases;
+    Names.clearChains();
+
+    await resolveVersionConflicts(mapVersion!, data);
+
+    const styleRecord = data[48] ? safeParseJSON(data[48]) : undefined; // data[48] should be already migrated by auto-update
+    Styles.set(Styles.parse(styleRecord));
+    await Controllers.StylePresetsEditor.ensureGroupStyles();
+
+    Icons.syncCustom();
+
+    if (data[50]) Layers.restore(JSON.parse(data[50]));
+    if (data[51]) GraphOverride.restore(JSON.parse(data[51]));
+
+    Goods.sync();
+    Markets.sync();
+    Routes.sync();
+    TradeAnimation.sync();
+    Journeys.sync();
+
+    select("#scaleBar")
+      .on("mousemove", () => tip("Click to open Units Editor"))
+      .on("click", () => window.Controllers.UnitsEditor.open());
+    select("#legend")
+      .on("mousemove", () => tip("Drag to change the position. Click to hide the legend box"))
+      .on("click", onLegendClick);
+
+    // add custom heightmap color scheme if any
+    for (const { scheme } of [
+      styles.heightmap.groups.oceanHeights.options,
+      styles.heightmap.groups.landHeights.options
+    ]) {
+      HeightmapColorSchemes.ensure(scheme);
+    }
+
+    // data integrity checks
+    {
+      const { cells, vertices } = pack;
+
+      const cellsMismatch = cells.i.length !== cells.state.length;
+      const featureVerticesMismatch = pack.features.some(f => f?.vertices?.some(vertex => !vertices.p[vertex]));
+
+      if (cellsMismatch || featureVerticesMismatch) {
+        const message = "[Data integrity] Striping issue detected. To fix try to edit the heightmap in ERASE mode";
+        throw new Error(message);
+      }
+
+      const invalidStates = [...new Set(cells.state)].filter(s => !pack.states[s] || pack.states[s].removed);
+      invalidStates.forEach(s => {
+        const invalidCells = cells.i.filter(i => cells.state[i] === s);
+        invalidCells.forEach(i => {
+          cells.state[i] = 0;
+        });
+        ERROR && console.error("[Data integrity] Invalid state", s, "is assigned to cells", invalidCells);
+      });
+
+      const invalidProvinces = [...new Set(cells.province)].filter(
+        p => p && (!pack.provinces[p] || (pack.provinces[p] as { removed?: boolean }).removed)
+      );
+      invalidProvinces.forEach(p => {
+        const invalidCells = cells.i.filter(i => cells.province[i] === p);
+        invalidCells.forEach(i => {
+          cells.province[i] = 0;
+        });
+        ERROR && console.error("[Data integrity] Invalid province", p, "is assigned to cells", invalidCells);
+      });
+
+      const invalidCultures = [...new Set(cells.culture)].filter(c => !pack.cultures[c] || pack.cultures[c].removed);
+      invalidCultures.forEach(c => {
+        const invalidCells = cells.i.filter(i => cells.culture[i] === c);
+        invalidCells.forEach(i => {
+          cells.province[i] = 0;
+        });
+        ERROR && console.error("[Data integrity] Invalid culture", c, "is assigned to cells", invalidCells);
+      });
+
+      const invalidReligions = [...new Set(cells.religion)].filter(
+        r => !pack.religions[r] || pack.religions[r].removed
+      );
+      invalidReligions.forEach(r => {
+        const invalidCells = cells.i.filter(i => cells.religion[i] === r);
+        invalidCells.forEach(i => {
+          cells.religion[i] = 0;
+        });
+        ERROR && console.error("[Data integrity] Invalid religion", r, "is assigned to cells", invalidCells);
+      });
+
+      const invalidFeatures = [...new Set(cells.f)].filter(f => f && !pack.features[f]);
+      invalidFeatures.forEach(f => {
+        const invalidCells = cells.i.filter(i => cells.f[i] === f);
+        // No fix as for now
+        ERROR && console.error("[Data integrity] Invalid feature", f, "is assigned to cells", invalidCells);
+      });
+
+      const invalidBurgs = [...new Set(cells.burg)].filter(
+        burgId => burgId && (!pack.burgs[burgId] || pack.burgs[burgId].removed)
+      );
+      invalidBurgs.forEach(burgId => {
+        const invalidCells = cells.i.filter(i => cells.burg[i] === burgId);
+        invalidCells.forEach(i => {
+          cells.burg[i] = 0;
+        });
+        ERROR && console.error("[Data integrity] Invalid burg", burgId, "is assigned to cells", invalidCells);
+      });
+
+      const invalidRivers = [...new Set(cells.r)].filter(r => r && !pack.rivers.find(river => river.i === r));
+      invalidRivers.forEach(r => {
+        const invalidCells = cells.i.filter(i => cells.r[i] === r);
+        invalidCells.forEach(i => {
+          cells.r[i] = 0;
+        });
+        ERROR && console.error("[Data integrity] Invalid river", r, "is assigned to cells", invalidCells);
+      });
+
+      pack.burgs.forEach(burg => {
+        if (typeof burg.capital === "boolean") burg.capital = Number(burg.capital);
+
+        if (!burg.i && burg.lock) {
+          ERROR && console.error(`[Data integrity] Burg 0 is marked as locked, removing the status`);
+          delete burg.lock;
+          return;
+        }
+
+        if (burg.removed && burg.lock) {
+          ERROR && console.error(`[Data integrity] Removed burg ${burg.i} is marked as locked. Unlocking the burg`);
+          delete burg.lock;
+          return;
+        }
+
+        if (!burg.i || burg.removed) return;
+
+        if (burg.cell === undefined || burg.x === undefined || burg.y === undefined) {
+          ERROR &&
+            console.error(`[Data integrity] Burg ${burg.i} is missing cell info or coordinates. Removing the burg`);
+          burg.removed = true;
+        }
+
+        if ((burg.port ?? 0) < 0) {
+          ERROR && console.error("[Data integrity] Burg", burg.i, "has invalid port value", burg.port);
+          burg.port = 0;
+        }
+
+        if (burg.cell >= cells.i.length) {
+          ERROR && console.error("[Data integrity] Burg", burg.i, "is linked to invalid cell", burg.cell);
+          burg.cell = Pack.findCell(burg.x, burg.y)!;
+          cells.i
+            .filter(i => cells.burg[i] === burg.i)
+            .forEach(i => {
+              cells.burg[i] = 0;
+            });
+          cells.burg[burg.cell] = burg.i;
+        }
+
+        if (burg.state && !pack.states[burg.state]) {
+          ERROR && console.error("[Data integrity] Burg", burg.i, "is linked to invalid state", burg.state);
+          burg.state = 0;
+        }
+
+        if (burg.state && pack.states[burg.state].removed) {
+          ERROR && console.error("[Data integrity] Burg", burg.i, "is linked to removed state", burg.state);
+          burg.state = 0;
+        }
+
+        if (burg.state === undefined) {
+          ERROR && console.error("[Data integrity] Burg", burg.i, "has no state data");
+          burg.state = 0;
+        }
+      });
+
+      pack.states.forEach(state => {
+        if (state.removed) return;
+
+        const stateBurgs = pack.burgs.filter(b => b.state === state.i && !b.removed);
+        const capitalBurgs = stateBurgs.filter(b => b.capital);
+
+        if (!state.i && capitalBurgs.length) {
+          ERROR &&
+            console.error(
+              `[Data integrity] Neutral burgs (${capitalBurgs.map(b => b.i).join(", ")}) marked as capitals`
+            );
+
+          capitalBurgs.forEach(burg => {
+            burg.capital = 0;
+            Burgs.changeGroup(burg, null);
+          });
+
+          return;
+        }
+
+        if (capitalBurgs.length > 1) {
+          const message = `[Data integrity] State ${state.i} has multiple capitals (${capitalBurgs
+            .map(b => b.i)
+            .join(", ")}) assigned. Keeping the first as capital and moving others`;
+          ERROR && console.error(message);
+
+          capitalBurgs.forEach((burg, i) => {
+            if (!i) return;
+            burg.capital = 0;
+            Burgs.changeGroup(burg, null);
+          });
+
+          return;
+        }
+
+        if (state.i && stateBurgs.length && !capitalBurgs.length) {
+          ERROR && console.error(`[Data integrity] State ${state.i} has no capital. Making the first burg capital`);
+          const capital = stateBurgs[0];
+          capital.capital = 1;
+          Burgs.changeGroup(capital, null);
+        }
+      });
+
+      pack.provinces.forEach(p => {
+        if (!p?.i || p?.removed) return;
+        const state = pack.states[p.state];
+        if (state && !state.removed) return;
+        ERROR &&
+          console.error(
+            `[Data integrity] Province ${p.i} is linked to removed state ${p.state}. Removing the province`
+          );
+        p.removed = true;
+      });
+
+      // drop the broken route object only: a valid route may share its id. Its cell links are cleaned below
+      pack.routes = pack.routes.filter(route => {
+        if (route.points?.length >= 2) return true;
+        ERROR && console.error(`[Data integrity] Route ${route.i} has less than 2 points. Removing the route`);
+        return false;
+      });
+
+      for (const from in pack.cells.routes) {
+        const value = pack.cells.routes[+from];
+        if (!value) continue;
+
+        if (Object.keys(value).length === 0) {
+          // remove empty object
+          delete pack.cells.routes[+from];
+          continue;
+        }
+
+        for (const to in value) {
+          const routeId = value[+to];
+          const route = pack.routes.find(r => r.i === routeId);
+          if (!route) {
+            ERROR &&
+              console.error(`[Data integrity] Route ${routeId} from ${from} to ${to} is missing. Removing the route`);
+            delete pack.cells.routes[+from][+to];
+          }
+        }
+      }
+
+      {
+        const markerIds: boolean[] = [];
+        let nextId = (last(pack.markers)?.i ?? -1) + 1 || 0;
+
+        pack.markers.forEach(marker => {
+          if (markerIds[marker.i]) {
+            ERROR && console.error("[Data integrity] Marker", marker.i, "has non-unique id. Changing to", nextId);
+
+            const domElements = document.querySelectorAll<HTMLElement>(`#marker${marker.i}`);
+            if (domElements[1]) domElements[1].id = `marker${nextId}`; // rename 2nd dom element
+
+            marker.i = nextId;
+            nextId += 1;
+          } else {
+            markerIds[marker.i] = true;
+          }
+        });
+
+        // sort markers by index
+        pack.markers.sort((a, b) => a.i - b.i);
+      }
+
+      {
+        // segment transports with no transport type behind them - they'd silently fall back to air rules
+        const transportNames = new Set(Transports.all.map(transport => transport.name));
+        const orphans = new Set<string>();
+        for (const journey of pack.journeys) {
+          for (const segment of journey.segments) {
+            if (!transportNames.has(segment.transport)) orphans.add(segment.transport);
+          }
+        }
+
+        if (orphans.size) {
+          const names = [...orphans];
+          ERROR && console.error("[Data integrity] Journey transports missing", names.map(escapeHtml).join(", "));
+        }
+      }
+    }
+
+    Layers.drawAll();
+    Styles.writeAll();
+    applyVignetteOptions(); // the vignette mask is renderer-owned; its applier shapes it from the store
+    applyPerformanceSettings(); // the file's SVG carries the attributes of the browser that saved it
+    applyDefaultViewboxEvents();
+    fitMapToScreen();
+    resetZoom(0); // an opened map is shown fitted, whatever window size it was made on
+    focusOn();
+    invokeActiveZooming();
+
+    WARN && console.warn(`TOTAL: ${rn((performance.now() - uploadTimeStart) / 1000, 2)}s`);
+
+    Options.persist(); // the migrations run after the adoption, and they change the map too
+
+    const mapCreatedAt = +data[0].split("|")[6] || Date.now();
+    registerMap(mapCreatedAt);
+    logStats();
+    tip("Map is successfully loaded", true, "success", 7000);
+  } catch (error) {
+    ERROR && console.error(error);
+    clearMainTip();
+
+    alertMessage.innerHTML = /* html */ `An error occurred while loading the map. Select a different file to load, <br>generate a new random map or cancel the loading.<br>Map version: ${mapVersion}. Generator version: ${VERSION}.
+      <p id="errorBox">${parseError(error as Error)}</p>`;
+
+    $("#alert").dialog({
+      resizable: false,
+      title: "Loading error",
+      maxWidth: "40em",
+      buttons: {
+        "Clear cache": () => clearCache(),
+        "Select file": function (this: HTMLElement) {
+          $(this).dialog("close");
+          pickMapFile();
+        },
+        "New map": function (this: HTMLElement) {
+          $(this).dialog("close");
+          regenerateMap("loading error");
+        },
+        Cancel: function (this: HTMLElement) {
+          $(this).dialog("close");
+        }
+      },
+      position: { my: "center", at: "center", of: "svg" }
+    });
+  } finally {
+    if (isLogGroupOpen) console.groupEnd();
+  }
+}
+
+export const Load = {
+  quickLoad,
+  loadFromDropbox,
+  createSharableDropboxLink,
+  loadMapFromURL,
+  showUploadErrorMessage,
+  uploadMap
+};

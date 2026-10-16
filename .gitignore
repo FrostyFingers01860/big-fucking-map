@@ -1,0 +1,26 @@
+# Downloaded toolchains and reinstallable dependencies
+/.runtime/
+/Fantasy-Map-Generator/node_modules/
+
+# Generated output and caches
+/build/
+/data/terrain-tiles/
+/data/terrain-tiles-3d/
+/data/first-person.properties
+/Fantasy-Map-Generator/dist/
+/Fantasy-Map-Generator/dist-electron/
+/Fantasy-Map-Generator/release/
+/TownGeneratorOS/.tools/
+/TownGeneratorOS/.haxelib/
+/TownGeneratorOS/Export/
+
+# Local safety backups; Git history replaces these for public releases
+/backup-before-*/
+/backup-upstream-git-metadata/
+
+# Local/editor files
+.idea/
+.vscode/
+*.log
+Thumbs.db
+.DS_Store

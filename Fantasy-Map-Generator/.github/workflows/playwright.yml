@@ -1,0 +1,56 @@
+name: Playwright Tests
+on:
+  pull_request:
+    branches: [master, "[0-9]*.[0-9]*.[0-9]*"]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+env:
+  # Electron is only needed to package the desktop app, skip its ~100 MB binary here
+  ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+
+jobs:
+  test:
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: "npm"
+      - name: Install dependencies
+        run: npm ci
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ hashFiles('package-lock.json') }}
+      - name: Install Playwright Browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps chromium
+      - name: Install Playwright system deps
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
+      - name: Cache build output
+        id: dist-cache
+        uses: actions/cache@v6
+        with:
+          path: dist/
+          key: dist-${{ hashFiles('src/**', 'public/**', 'vite.config.ts',
+            'tsconfig.json', 'package-lock.json') }}
+      - name: Build app
+        if: steps.dist-cache.outputs.cache-hit != 'true'
+        run: npm run build
+      - name: Run Playwright tests
+        run: npm run test:e2e
+        env:
+          SKIP_BUILD: "1"
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 30

@@ -1,0 +1,997 @@
+import type { Selection } from "d3";
+import { select } from "d3";
+import { type IconSetId, IconSets } from "@/components/icon-sets";
+import { Icons } from "@/components/icons";
+import { Layers } from "@/components/layers";
+import { tip } from "@/components/tooltips";
+import { viewport, ZOOM_CURVES, type ZoomedLayer, zoomFontSize } from "@/components/viewport";
+import { renderEmblemDefinitions } from "@/renderers/draw-emblems";
+import { drawScaleBar } from "@/renderers/draw-scalebar";
+import { HeightmapColorSchemes } from "@/renderers/heightmap-color-schemes";
+import { ViewportLayers } from "@/renderers/viewport/viewport-renderer";
+import { getUsedFonts, loadFontsAsDataURI } from "@/services/fonts";
+import { savedMessage } from "@/services/platform";
+import {
+  connectVertices,
+  downloadFile,
+  ensureEl,
+  findEl,
+  getBase64,
+  getCellPopulation,
+  getCoordinates,
+  getFileName,
+  getFriendlyHeight,
+  loadScript,
+  rn,
+  unique
+} from "@/utils";
+import {
+  convertBlurFilters,
+  getReferencedDefinitions,
+  normalizeSvgLinks,
+  resolveLabelCase,
+  splitLabelLines
+} from "./svg-export";
+
+type MapSelection = Selection<SVGSVGElement, unknown, null, undefined>;
+
+// project canvas coordinates to geographic [lon, lat], rounded to 4 decimals
+const toGeoCoordinates = (x: number, y: number) =>
+  getCoordinates(x, y, options.map.geography.coordinates, options.map.graph.width, options.map.graph.height, 4);
+
+export interface GetMapURLOptions {
+  debug?: boolean;
+  noLabels?: boolean;
+  noWater?: boolean;
+  noScaleBar?: boolean;
+  noIce?: boolean;
+  noVignette?: boolean;
+  fullMap?: boolean;
+  region?: Region;
+  noViewbox?: boolean; // accepted by some callers (view-3d); currently unused here
+}
+
+/** A map-space box drawn into an image of the given pixel size */
+export interface Region {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+  width: number;
+  height: number;
+}
+
+async function exportToSvg(): Promise<void> {
+  TIME && console.time("exportToSvg");
+  try {
+    const url = await getMapURL("svg", { fullMap: true });
+    const link = document.createElement("a");
+    link.download = `${getFileName()}.svg`;
+    link.href = url;
+    link.click();
+
+    const message = savedMessage(link.download);
+    tip(message, true, "success", 5000);
+  } catch (error) {
+    ERROR && console.error(error);
+    tip(`SVG export failed: ${(error as Error)?.message || "Unknown error"}`, true, "error", 5000);
+  } finally {
+    TIME && console.timeEnd("exportToSvg");
+  }
+}
+
+async function exportToPng(): Promise<void> {
+  TIME && console.time("exportToPng");
+  try {
+    const url = await getMapURL("png");
+    const resolution = options.app.export.pngResolution;
+    const link = document.createElement("a");
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d")!;
+    canvas.width = viewport.width * resolution;
+    canvas.height = viewport.height * resolution;
+
+    const blob = await new Promise<Blob>((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        canvas.toBlob(blob => {
+          if (!blob) return reject(new Error("Cannot render PNG image"));
+          resolve(blob);
+        }, "image/png");
+      };
+      img.onerror = () => reject(new Error("Cannot load map image for PNG export"));
+      img.src = url;
+    });
+
+    link.download = `${getFileName()}.png`;
+    link.href = window.URL.createObjectURL(blob);
+    link.click();
+    window.setTimeout(() => {
+      canvas.remove();
+      window.URL.revokeObjectURL(link.href);
+    }, 1000);
+
+    const message = `${savedMessage(link.download)}. You can set image scale in options`;
+    tip(message, true, "success", 5000);
+  } catch (error) {
+    ERROR && console.error(error);
+    tip(`PNG export failed: ${(error as Error)?.message || "Unknown error"}`, true, "error", 5000);
+  } finally {
+    TIME && console.timeEnd("exportToPng");
+  }
+}
+
+/** A data URL of the map region at `scale` times its pixel size, as the map is styled and layered now */
+async function getRegionImage(
+  region: Region,
+  scale = 2,
+  type: "image/png" | "image/jpeg" = "image/png"
+): Promise<string> {
+  const url = await getMapURL("png", { region, noScaleBar: true, noVignette: true });
+  const canvas = document.createElement("canvas");
+  canvas.width = region.width * scale;
+  canvas.height = region.height * scale;
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const ctx = canvas.getContext("2d")!;
+      if (type === "image/jpeg") {
+        ctx.fillStyle = "#fff"; // JPEG has no transparency
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+      }
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      resolve(canvas.toDataURL(type, 0.85));
+    };
+    img.onerror = () => reject(new Error("Cannot draw the map region"));
+    img.src = url;
+  });
+}
+
+async function exportToJpeg(): Promise<void> {
+  TIME && console.time("exportToJpeg");
+  try {
+    const url = await getMapURL("png");
+    const resolution = options.app.export.pngResolution;
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d")!;
+    canvas.width = viewport.width * resolution;
+    canvas.height = viewport.height * resolution;
+
+    const quality = Math.min(rn(1 - resolution / 20, 2), 0.92);
+    const blob = await new Promise<Blob>((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        canvas.toBlob(
+          blob => {
+            if (!blob) return reject(new Error("Cannot render JPEG image"));
+            resolve(blob);
+          },
+          "image/jpeg",
+          quality
+        );
+      };
+      img.onerror = () => reject(new Error("Cannot load map image for JPEG export"));
+      img.src = url;
+    });
+
+    const link = document.createElement("a");
+    link.download = `${getFileName()}.jpeg`;
+    link.href = window.URL.createObjectURL(blob);
+    link.click();
+    tip(savedMessage(link.download), true, "success", 7000);
+    window.setTimeout(() => window.URL.revokeObjectURL(link.href), 5000);
+  } catch (error) {
+    ERROR && console.error(error);
+    tip(`JPEG export failed: ${(error as Error)?.message || "Unknown error"}`, true, "error", 5000);
+  } finally {
+    TIME && console.timeEnd("exportToJpeg");
+  }
+}
+
+async function exportToPngTiles(): Promise<void> {
+  const status = ensureEl("tileStatus");
+  status.innerHTML = "Preparing files...";
+
+  const urlSchema = await getMapURL("tiles", { debug: true, fullMap: true });
+  await loadScript("libs/jszip.min.js");
+  const zip = new window.JSZip();
+
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d")!;
+  canvas.width = options.map.graph.width;
+  canvas.height = options.map.graph.height;
+
+  const imgSchema = new Image();
+  imgSchema.src = urlSchema;
+  await loadImage(imgSchema);
+
+  status.innerHTML = "Rendering schema...";
+  ctx.drawImage(imgSchema, 0, 0, canvas.width, canvas.height);
+  const blob = await canvasToBlob(canvas, "image/png");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  zip.file("schema.png", blob);
+
+  // download tiles
+  const url = await getMapURL("tiles", { fullMap: true });
+  const { cols: tilesX, rows: tilesY, scale } = options.app.export.tiles;
+  const tolesTotal = tilesX * tilesY;
+
+  const tileW = (options.map.graph.width / tilesX) | 0;
+  const tileH = (options.map.graph.height / tilesY) | 0;
+
+  const width = options.map.graph.width * scale;
+  const height = width * (tileH / tileW);
+  canvas.width = width;
+  canvas.height = height;
+
+  const img = new Image();
+  img.src = url;
+  await loadImage(img);
+
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  function getRowLabel(row: number) {
+    const first = row >= alphabet.length ? alphabet[Math.floor(row / alphabet.length) - 1] : "";
+    const last = alphabet[row % alphabet.length];
+    return first + last;
+  }
+
+  for (let y = 0, row = 0, id = 1; y + tileH <= options.map.graph.height; y += tileH, row++) {
+    const rowName = getRowLabel(row);
+
+    for (let x = 0, cell = 1; x + tileW <= options.map.graph.width; x += tileW, cell++, id++) {
+      status.innerHTML = `Rendering tile ${rowName}${cell} (${id} of ${tolesTotal})...`;
+      ctx.drawImage(img, x, y, tileW, tileH, 0, 0, width, height);
+      const blob = await canvasToBlob(canvas, "image/png");
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      zip.file(`${rowName}${cell}.png`, blob);
+    }
+  }
+
+  status.innerHTML = "Zipping files...";
+  zip
+    .generateAsync({ type: "blob" })
+    .then((blob: Blob) => {
+      status.innerHTML = "Downloading the archive...";
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = `${getFileName()}.zip`;
+      link.click();
+      link.remove();
+
+      status.innerHTML = savedMessage("The .zip file");
+      setTimeout(() => URL.revokeObjectURL(link.href), 5000);
+    })
+    .catch((error: Error) => {
+      ERROR && console.error(error);
+      status.innerHTML = "Tiles export failed";
+      tip(`PNG tiles export failed: ${error?.message || "Unknown error"}`, true, "error", 5000);
+    });
+
+  // promisified img.onload
+  function loadImage(img: HTMLImageElement) {
+    return new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = err => reject(err);
+    });
+  }
+
+  // promisified canvas.toBlob
+  function canvasToBlob(canvas: HTMLCanvasElement, mimeType: string, qualityArgument = 1) {
+    return new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob(
+        blob => {
+          if (blob) resolve(blob);
+          else reject(new Error("Canvas toBlob() error"));
+        },
+        mimeType,
+        qualityArgument
+      );
+    });
+  }
+}
+
+/** Capture map-carried art before waiting; missing built-ins are completed from immutable chunks. */
+function captureIconDefinitions(clone: SVGSVGElement, source: SVGSVGElement): () => Promise<void> {
+  const defs = clone.querySelector("defs")!;
+  const required = new Set<IconSetId>();
+  const missing = new Set<string>();
+
+  const iconReferences = (root: ParentNode): string[] =>
+    Array.from(root.querySelectorAll("use")).flatMap(use =>
+      [use.getAttribute("href"), use.getAttribute("xlink:href")]
+        .filter((href): href is string => !!href?.startsWith("#"))
+        .map(href => href.slice(1))
+    );
+
+  // copies what an id points at into the clone, then what that definition references in turn
+  const inline = (find: (id: string) => Element | null, onMissing: (id: string) => void) => {
+    const visited = new Set<string>();
+    const walk = (id: string): void => {
+      if (visited.has(id)) return;
+      visited.add(id);
+      let definition = clone.getElementById(id);
+      if (!definition) {
+        const original = find(id);
+        if (original) definition = defs.appendChild(original.cloneNode(true) as Element);
+      }
+      if (definition) for (const target of iconReferences(definition)) walk(target);
+      else onMissing(id);
+    };
+    return walk;
+  };
+
+  // the snapshot may reference art no chunk provides (custom goods), so copy whatever it points at
+  const capture = inline(
+    id => source.getElementById(id),
+    id => {
+      const set = IconSets.setForId(id);
+      if (!set) return;
+      required.add(set);
+      missing.add(id);
+    }
+  );
+  for (const id of iconReferences(clone)) capture(id);
+
+  // after the wait only chunk-owned definitions may be read from the live document
+  const resolve = inline(
+    id => {
+      const set = IconSets.setForId(id);
+      if (!set) return null;
+      const original = source.getElementById(id);
+      return Icons.group(set)?.contains(original) ? original : null;
+    },
+    // the set loaded but has no such symbol (a stale reference): its uses draw nothing, as in the app
+    id => {
+      if (IconSets.setForId(id)) WARN && console.warn(`Export: missing icon definition ${id}`);
+    }
+  );
+
+  return async () => {
+    await Icons.require(required);
+    for (const id of missing) resolve(id);
+  };
+}
+
+// parse map svg to object url
+async function getMapURL(type: string, config: GetMapURLOptions = {}): Promise<string> {
+  const {
+    debug = false,
+    noLabels = false,
+    noWater = false,
+    noScaleBar = false,
+    noIce = false,
+    noVignette = false,
+    fullMap = false,
+    region
+  } = config;
+  const cloneEl = ensureEl("map").cloneNode(true) as SVGSVGElement;
+  cloneEl.id = "fantasyMap";
+  document.body.appendChild(cloneEl);
+  const clone: MapSelection = select(cloneEl);
+  try {
+    if (!debug) clone.select("#debug").remove();
+
+    const cloneDefs = cloneEl.getElementsByTagName("defs")[0];
+    const svgDefs = ensureEl<SVGSVGElement>("defElements");
+
+    if (fullMap) {
+      // reset transform to show the whole map
+      clone.attr("width", options.map.graph.width).attr("height", options.map.graph.height);
+      clone.select("#viewbox").attr("transform", null);
+      // the zoomed layers at their scale 1 font size
+      for (const layer of Object.keys(ZOOM_CURVES) as ZoomedLayer[]) {
+        clone.select(`#${layer}`).attr("font-size", `${zoomFontSize(layer, 1)}px`);
+      }
+
+      if (!noScaleBar) drawScaleBar(cloneEl, 1, options.map.graph.width, options.map.graph.height);
+    }
+
+    let bounds = fullMap ? undefined : ViewportLayers.getVisibleBounds();
+    if (region) {
+      const { x0, y0, x1, y1, width, height } = region;
+      const scale = Math.min(width / (x1 - x0), height / (y1 - y0));
+      const x = (width - (x1 - x0) * scale) / 2 - x0 * scale;
+      const y = (height - (y1 - y0) * scale) / 2 - y0 * scale;
+      clone.attr("width", width).attr("height", height);
+      clone.select("#viewbox").attr("transform", `translate(${x} ${y}) scale(${scale})`);
+      for (const layer of Object.keys(ZOOM_CURVES) as ZoomedLayer[]) {
+        clone.select(`#${layer}`).attr("font-size", `${zoomFontSize(layer, scale)}px`);
+      }
+      bounds = { scale, x0: -x / scale, y0: -y / scale, x1: (width - x) / scale, y1: (height - y) / scale };
+    }
+
+    ViewportLayers.renderTo(cloneEl, bounds);
+
+    const isFirefox = navigator.userAgent.toLowerCase().indexOf("firefox") > -1;
+    if (isFirefox && type === "mesh") clone.select("#oceanPattern").remove();
+    if (noLabels) {
+      clone.selectAll("#labels [data-label-type]").remove();
+      clone.selectAll("#textPaths [data-label-type]").remove();
+      clone.selectAll("#burgIcons [data-group='icons']").remove();
+    }
+    if (noWater) {
+      clone.select("#oceanBase").attr("opacity", 0);
+      clone.select("#oceanPattern").attr("opacity", 0);
+    }
+    if (noIce) clone.select("#ice").remove();
+    if (noVignette) clone.select("#vignette").remove();
+    if (noScaleBar) clone.select("#scaleBar").remove();
+
+    if (type === "svg") removeUnusedElements(clone);
+    relocateRootFilter(cloneEl); // Firefox drops a root-svg filter when the svg is rasterized via an image
+    if (customization && type === "mesh") updateMeshCells(clone);
+    inlineStyle(clone);
+
+    const referencedDefinitions = getReferencedDefinitions(cloneEl);
+    // remove unused filters
+    const filters = cloneEl.querySelectorAll("filter");
+    for (let i = 0; i < filters.length; i++) {
+      const id = filters[i].id;
+      if (referencedDefinitions.has(id)) continue;
+      filters[i].remove();
+    }
+
+    // remove unused patterns
+    const patterns = cloneEl.querySelectorAll("pattern");
+    for (let i = 0; i < patterns.length; i++) {
+      const id = patterns[i].id;
+      if (referencedDefinitions.has(id)) continue;
+      patterns[i].remove();
+    }
+
+    // remove unused symbols
+    const symbols = cloneEl.querySelectorAll("symbol");
+    for (let i = 0; i < symbols.length; i++) {
+      const id = symbols[i].id;
+      if (cloneEl.querySelector(`use[*|href='#${id}']`)) continue;
+      symbols[i].remove();
+    }
+
+    // viewport layers only keep visible emblems live; full-map rendering materializes all of them into the clone
+    const cloneEmblems = cloneEl.getElementById("emblems")?.querySelectorAll("use") ?? [];
+    if (Layers.isOn("emblems") && cloneEmblems.length) {
+      const releaseDefinitions = await renderEmblemDefinitions(cloneEl);
+      cloneEmblems.forEach(el => {
+        const href = el.getAttribute("href") || el.getAttribute("xlink:href");
+        if (!href) return;
+        const id = href.slice(1);
+        const emblem = findEl(id);
+        if (!emblem) return;
+        cloneEl.getElementById(id)?.remove();
+        cloneDefs.append(emblem.cloneNode(true));
+      });
+      releaseDefinitions(); // the clone owns its copies now, so the map keeps only the emblems it shows
+    } else {
+      cloneDefs.querySelector("#defs-emblems")?.remove();
+    }
+
+    const completeIcons = captureIconDefinitions(cloneEl, svgDefs);
+    await completeIcons();
+
+    {
+      // Embed the ocean pattern; drop broken images.
+      const image = cloneEl.getElementById("oceanicPattern");
+      const href = image?.getAttribute("href") ?? image?.getAttribute("xlink:href");
+      if (image && href) {
+        await new Promise<void>(resolve => {
+          getBase64(href, base64 => {
+            if (typeof base64 === "string") image.setAttribute("href", base64);
+            else image.remove();
+            resolve();
+          });
+        });
+      }
+    }
+
+    {
+      // Embed the texture; drop broken images.
+      const image = cloneEl.querySelector("#texture > image");
+      const href = image?.getAttribute("href") ?? image?.getAttribute("xlink:href");
+      if (image && href) {
+        await new Promise<void>(resolve => {
+          getBase64(href, base64 => {
+            if (typeof base64 === "string") image.setAttribute("href", base64);
+            else image.remove();
+            resolve();
+          });
+        });
+      }
+    }
+
+    // add wind rose
+    if (cloneEl.getElementById("compass")) {
+      const rose = svgDefs.getElementById("defs-compass-rose");
+      if (rose) cloneDefs.appendChild(rose.cloneNode(true));
+    }
+
+    // add grid pattern
+    if (cloneEl.getElementById("gridOverlay")?.hasChildNodes()) {
+      const type = styles.grid.options.type || "pointyHex";
+      const pattern = svgDefs.getElementById(`pattern_${type}`);
+      if (pattern) cloneDefs.appendChild(pattern.cloneNode(true));
+    }
+
+    if (type !== "svg") await inlineLinkedImages(cloneEl);
+
+    const fogMask = cloneEl.getElementById("fog");
+    if (!fogMask?.querySelector("path")) fogMask?.remove(); // the fog mask is unused until an area is revealed
+    if (!cloneEl.getElementById("regions")) cloneEl.getElementById("statePaths")?.remove(); // removed unused statePaths
+    if (!cloneEl.getElementById("labels")) cloneEl.getElementById("textPaths")?.remove(); // removed unused textPaths
+
+    // add armies style
+    if (cloneEl.getElementById("armies")) {
+      cloneEl.insertAdjacentHTML(
+        "afterbegin",
+        "<style>#armies text {stroke: none; fill: #fff; text-shadow: 0 0 4px #000; dominant-baseline: central; text-anchor: middle; font-family: Helvetica; fill-opacity: 1;}#armies use.regimentIcon {fill: #fff; text-shadow: 0 0 4px #000;}</style>"
+      );
+    }
+
+    if (type === "svg") flattenSymbolReferences(cloneEl);
+
+    // add hatchings
+    const hatchingUsers = cloneEl.querySelectorAll(`[fill^='url(#hatch']`);
+    const hatchingFills = unique(Array.from(hatchingUsers).map(el => el.getAttribute("fill")));
+    const hatchingIds = hatchingFills.map(fill => fill!.slice(5, -1));
+    for (const hatchingId of hatchingIds) {
+      const hatching = svgDefs.getElementById(hatchingId);
+      if (hatching) cloneDefs.appendChild(hatching.cloneNode(true));
+    }
+
+    // load fonts
+    const usedFonts = getUsedFonts(cloneEl);
+    const fontsToLoad = usedFonts.filter(font => font.src);
+    if (fontsToLoad.length) {
+      const dataURLfonts = await loadFontsAsDataURI(fontsToLoad);
+
+      const fontFaces = dataURLfonts
+        .map(({ family, src, unicodeRange = "", variant = "normal" }) => {
+          return `@font-face {font-family: "${family}"; src: ${src}; unicode-range: ${unicodeRange}; font-variant: ${variant};}`;
+        })
+        .join("\n");
+
+      const style = document.createElementNS("http://www.w3.org/2000/svg", "style");
+      style.setAttribute("type", "text/css");
+      style.innerHTML = fontFaces;
+      cloneEl.querySelector("defs")!.appendChild(style);
+    }
+
+    if (type === "svg") {
+      resolveLabelCase(cloneEl);
+      splitLabelLines(cloneEl);
+      convertBlurFilters(cloneEl);
+      normalizeSvgLinks(cloneEl);
+    }
+
+    clone.remove();
+
+    const serialized = `<?xml version="1.0" encoding="UTF-8" standalone="no"?>${new XMLSerializer().serializeToString(cloneEl)}`;
+    const blob = new Blob([serialized], { type: "image/svg+xml;charset=utf-8" });
+    const url = window.URL.createObjectURL(blob);
+    window.setTimeout(() => window.URL.revokeObjectURL(url), 5000);
+    return url;
+  } finally {
+    cloneEl.remove();
+  }
+}
+
+// resolve the font-size an em-sized symbol would inherit at this node
+function getInheritedFontSize(el: Element | null): number {
+  let ratio = 1;
+  for (; el; el = el.parentElement) {
+    const style = el.getAttribute("style");
+    const value =
+      style?.match(/font-size\s*:\s*([\d.]+[a-z%]*)/i)?.[1] ||
+      style?.match(/font\s*:[^;]*?([\d.]+(?:px|pt|r?em|%))/i)?.[1] ||
+      el.getAttribute("font-size");
+    const match = value?.trim().match(/^([\d.]+)([a-z%]*)$/i);
+    if (!match || !Number.isFinite(parseFloat(match[1]))) continue;
+    const [size, unit] = [parseFloat(match[1]), match[2].toLowerCase()];
+    if (unit === "%") ratio *= size / 100;
+    else if (unit === "em") ratio *= size;
+    else if (unit === "rem") return ratio * size * 16;
+    else if (unit === "pt") return (ratio * size * 4) / 3;
+    else return ratio * size; // px or unitless
+  }
+  return ratio * 16;
+}
+
+// Inkscape (and other non-browser renderers) don't size use->symbol references reliably,
+// especially em-sized symbols, so bake the viewBox scaling into a transform and turn symbols into groups
+export function flattenSymbolReferences(svg: SVGSVGElement): void {
+  const flattened = new Set<SVGSymbolElement>();
+
+  svg.querySelectorAll("use").forEach(use => {
+    const href = use.getAttribute("href") || use.getAttribute("xlink:href");
+    if (!href?.startsWith("#")) return;
+    const symbol = svg.querySelector<SVGSymbolElement>(`symbol[id="${href.slice(1)}"]`);
+    if (!symbol) return;
+
+    const viewBox = (symbol.getAttribute("viewBox") || "").split(/[\s,]+/).map(Number);
+    const [minX, minY, vw, vh] = viewBox.length === 4 && viewBox.every(Number.isFinite) ? viewBox : [0, 0, 1, 1];
+
+    const resolveLength = (value: string | null): number | null => {
+      if (!value) return null;
+      const em = value.match(/^([\d.]+)em$/);
+      if (em) return parseFloat(em[1]) * getInheritedFontSize(use);
+      const number = parseFloat(value);
+      return Number.isFinite(number) && !value.includes("%") ? number : null;
+    };
+
+    const width = resolveLength(use.getAttribute("width")) ?? resolveLength(symbol.getAttribute("width")) ?? vw;
+    const height = resolveLength(use.getAttribute("height")) ?? resolveLength(symbol.getAttribute("height")) ?? vh;
+
+    const scale = Math.min(width / vw, height / vh);
+    const x = parseFloat(use.getAttribute("x") || "0");
+    const y = parseFloat(use.getAttribute("y") || "0");
+    const tx = rn(x + (width - vw * scale) / 2 - minX * scale, 2);
+    const ty = rn(y + (height - vh * scale) / 2 - minY * scale, 2);
+
+    for (const attr of ["x", "y", "width", "height"]) use.removeAttribute(attr);
+    const transform = `translate(${tx},${ty}) scale(${rn(scale, 4)})`;
+    const existing = use.getAttribute("transform");
+    use.setAttribute("transform", existing ? `${transform} ${existing}` : transform);
+    flattened.add(symbol);
+  });
+
+  flattened.forEach(symbol => {
+    const group = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    for (const attr of Array.from(symbol.attributes)) {
+      if (["viewBox", "width", "height", "overflow", "preserveAspectRatio"].includes(attr.name)) continue;
+      group.setAttribute(attr.name, attr.value);
+    }
+    let content = group;
+    if ((symbol.style.overflow || symbol.getAttribute("overflow")) !== "visible") {
+      const frame = Icons.parseFrame(symbol.getAttribute("viewBox") ?? "");
+      if (frame) {
+        const clip = document.createElementNS("http://www.w3.org/2000/svg", "clipPath");
+        clip.id = `${symbol.id}-export-clip`;
+        while (svg.getElementById(clip.id)) clip.id += "-1";
+        clip.setAttribute("clipPathUnits", "userSpaceOnUse");
+        const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+        for (const [index, name] of ["x", "y", "width", "height"].entries())
+          rect.setAttribute(name, String(frame[index]));
+        clip.appendChild(rect);
+        content = document.createElementNS("http://www.w3.org/2000/svg", "g");
+        content.setAttribute("clip-path", `url(#${clip.id})`);
+        group.append(clip, content);
+      }
+    }
+    while (symbol.firstChild) content.appendChild(symbol.firstChild);
+    symbol.replaceWith(group);
+  });
+}
+
+/** linked custom icons for a raster export; see docs/architecture/icons.md#exports */
+export async function inlineLinkedImages(svg: SVGSVGElement): Promise<void> {
+  const images = Array.from(svg.querySelectorAll<SVGImageElement>('symbol image[href^="http"]')).filter(
+    image => Icons.kind(image.closest("symbol")!.id) === "custom"
+  );
+  const byUrl = new Map<string, SVGImageElement[]>();
+  for (const image of images) {
+    const url = image.getAttribute("href")!;
+    byUrl.set(url, [...(byUrl.get(url) ?? []), image]);
+  }
+  await Promise.all(
+    [...byUrl].map(
+      ([url, users]) =>
+        new Promise<void>(resolve => {
+          getBase64(url, base64 => {
+            for (const image of users) {
+              if (typeof base64 === "string") image.setAttribute("href", base64);
+              else image.remove();
+            }
+            resolve();
+          });
+        })
+    )
+  );
+}
+
+// Filter the whole composition outside the zoom transform; Firefox and Inkscape need an inner group.
+export function relocateRootFilter(svg: SVGSVGElement): void {
+  const filter = svg.getAttribute("filter");
+  if (!filter || !svg.querySelector("#viewbox")) return;
+  const wrapper = document.createElementNS("http://www.w3.org/2000/svg", "g");
+  wrapper.setAttribute("filter", filter);
+  for (const group of svg.querySelectorAll(":scope > g")) wrapper.appendChild(group);
+  svg.appendChild(wrapper);
+  svg.removeAttribute("filter");
+}
+
+// remove hidden g elements and g elements without children to make downloaded svg smaller in size
+function removeUnusedElements(clone: MapSelection): void {
+  for (let empty = 1; empty; ) {
+    empty = 0;
+    clone.selectAll<SVGGElement, unknown>("g").each(function () {
+      if (!this.hasChildNodes() || this.style.display === "none" || this.classList.contains("hidden")) {
+        empty++;
+        this.remove();
+      }
+      if (this.hasAttribute("display") && this.style.display === "inline") this.removeAttribute("display");
+    });
+  }
+}
+
+function updateMeshCells(clone: MapSelection): void {
+  const renderOcean = ensureEl<HTMLInputElement>("renderOcean").checked;
+  const data = renderOcean ? grid.cells.i : grid.cells.i.filter((i: number) => grid.cells.h[i] >= 20);
+  const scheme = HeightmapColorSchemes.get(styles.heightmap.groups.landHeights.options.scheme);
+  clone.select("#heights").attr("filter", "url(#blur1)");
+  clone
+    .select("#heights")
+    .selectAll("polygon")
+    .data(data)
+    .join("polygon")
+    .attr("points", (d: number) => String(Grid.getPolygon(d)))
+    .attr("id", (d: number) => `cell${d}`)
+    .attr("stroke", (d: number) => HeightmapColorSchemes.getColor(grid.cells.h[d], scheme));
+}
+
+// for each g element get inline style
+function inlineStyle(clone: MapSelection): void {
+  const emptyG = clone.append("g").node()!;
+  const defaultStyles = window.getComputedStyle(emptyG);
+
+  clone.selectAll<SVGElement, unknown>("g, #ruler *, #scaleBar > text").each(function () {
+    const compStyle = window.getComputedStyle(this);
+    let style = "";
+
+    for (let i = 0; i < compStyle.length; i++) {
+      const key = compStyle[i];
+      const value = compStyle.getPropertyValue(key);
+
+      if (key === "cursor") continue; // cursor should be default
+      if (this.hasAttribute(key)) continue; // don't add style if there is the same attribute
+      if (value === defaultStyles.getPropertyValue(key)) continue;
+      style += `${key}:${value};`;
+    }
+
+    for (const key in compStyle) {
+      const value = compStyle.getPropertyValue(key);
+
+      if (key === "cursor") continue; // cursor should be default
+      if (this.hasAttribute(key)) continue; // don't add style if there is the same attribute
+      if (value === defaultStyles.getPropertyValue(key)) continue;
+      style += `${key}:${value};`;
+    }
+
+    if (style !== "") this.setAttribute("style", style);
+  });
+
+  emptyG.remove();
+}
+
+function saveGeoJsonCells(): void {
+  const { cells, vertices } = pack;
+  const json: { type: string; features: unknown[] } = { type: "FeatureCollection", features: [] };
+
+  const getPopulation = (i: number) => {
+    const [r, u] = getCellPopulation(i, pack);
+    return rn(r + u);
+  };
+
+  const getHeight = (i: number) => parseInt(getFriendlyHeight(cells.p[i], pack, grid), 10);
+
+  function getCellCoordinates(cellVertices: number[]) {
+    const coordinates = cellVertices.map(vertex => {
+      const [x, y] = vertices.p[vertex];
+      return toGeoCoordinates(x, y);
+    });
+    return [[...coordinates, coordinates[0]]];
+  }
+
+  cells.i.forEach(i => {
+    const coordinates = getCellCoordinates(cells.v[i]);
+    const height = getHeight(i);
+    const biome = cells.biome[i];
+    const type = pack.features[cells.f[i]].type;
+    const population = getPopulation(i);
+    const state = cells.state[i];
+    const province = cells.province[i];
+    const culture = cells.culture[i];
+    const religion = cells.religion[i];
+    const neighbors = cells.c[i];
+
+    const properties = { id: i, height, biome, type, population, state, province, culture, religion, neighbors };
+    const feature = { type: "Feature", geometry: { type: "Polygon", coordinates }, properties };
+    json.features.push(feature);
+  });
+
+  const fileName = `${getFileName("Cells")}.geojson`;
+  downloadFile(JSON.stringify(json), fileName, "application/json");
+}
+
+function saveGeoJsonRoutes(): void {
+  const features = pack.routes.map(route => {
+    const { i, points, group } = route;
+    const name = (route as { name?: string }).name ?? null;
+    const coordinates = points.map(([x, y]) => toGeoCoordinates(x, y));
+    return {
+      type: "Feature",
+      geometry: { type: "LineString", coordinates },
+      properties: { id: i, group, name }
+    };
+  });
+  const json = { type: "FeatureCollection", features };
+
+  const fileName = `${getFileName("Routes")}.geojson`;
+  downloadFile(JSON.stringify(json), fileName, "application/json");
+}
+
+function saveGeoJsonRivers(): void {
+  const features = pack.rivers.map(
+    ({ i, cells, points, source, mouth, parent, basin, widthFactor, sourceWidth, discharge, name, type }) => {
+      if (!cells || cells.length < 2) return null;
+      const meanderedPoints = Rivers.addMeandering(cells, points);
+      const coordinates = meanderedPoints.map(([x, y]) => toGeoCoordinates(x, y));
+      return {
+        type: "Feature",
+        geometry: { type: "LineString", coordinates },
+        properties: { id: i, source, mouth, parent, basin, widthFactor, sourceWidth, discharge, name, type }
+      };
+    }
+  );
+  const json = { type: "FeatureCollection", features };
+
+  const fileName = `${getFileName("Rivers")}.geojson`;
+  downloadFile(JSON.stringify(json), fileName, "application/json");
+}
+
+function saveGeoJsonMarkers(): void {
+  const features = pack.markers.map(marker => {
+    const { i, type, icon, x, y, size, fill, stroke, name, note } = marker as typeof marker & {
+      size?: number;
+      fill?: string;
+      stroke?: string;
+    };
+    const coordinates = toGeoCoordinates(x, y);
+    const properties = { id: i, type, icon, x, y, name, note, size, fill, stroke };
+    return { type: "Feature", geometry: { type: "Point", coordinates }, properties };
+  });
+
+  const json = { type: "FeatureCollection", features };
+
+  const fileName = `${getFileName("Markers")}.geojson`;
+  downloadFile(JSON.stringify(json), fileName, "application/json");
+}
+
+function saveGeoJsonZones(): void {
+  const { zones, cells, vertices } = pack;
+  const json: { type: string; features: unknown[] } = { type: "FeatureCollection", features: [] };
+
+  // Helper function to convert zone cells to polygon coordinates
+  // Handles multiple disconnected components and holes properly
+  function getZonePolygonCoordinates(zoneCells: number[]) {
+    const cellsInZone = new Set(zoneCells);
+    const ofSameType = (cellId: number) => cellsInZone.has(cellId);
+    const ofDifferentType = (cellId: number) => !cellsInZone.has(cellId);
+
+    const checkedCells = new Set<number>();
+    const rings: number[][][] = []; // Array of LinearRings (each ring is an array of coordinates)
+
+    // Find all boundary components by tracing each connected region
+    for (const cellId of zoneCells) {
+      if (checkedCells.has(cellId)) continue;
+
+      // Check if this cell is on the boundary (has a neighbor outside the zone)
+      const neighbors = cells.c[cellId];
+      const onBorder = neighbors.some(ofDifferentType);
+      if (!onBorder) continue;
+
+      // Check if this is an inner lake (hole) - skip if so
+      const feature = pack.features[cells.f[cellId]];
+      if (feature.type === "lake" && feature.shoreline) {
+        if (feature.shoreline.every(ofSameType)) continue;
+      }
+
+      // Find a starting vertex that's on the boundary
+      const cellVertices = cells.v[cellId];
+      let startingVertex = null;
+
+      for (const vertexId of cellVertices) {
+        const vertexCells = vertices.c[vertexId];
+        if (vertexCells.some(ofDifferentType)) {
+          startingVertex = vertexId;
+          break;
+        }
+      }
+
+      if (startingVertex === null) continue;
+
+      // Use connectVertices to trace the boundary (reusing existing logic)
+      const vertexChain = connectVertices({
+        vertices,
+        startingVertex,
+        ofSameType,
+        addToChecked: (cellId: number) => checkedCells.add(cellId),
+        closeRing: false // We'll close it manually after converting to coordinates
+      });
+
+      if (vertexChain.length < 3) continue;
+
+      // Convert vertex chain to coordinates
+      const coordinates: number[][] = [];
+      for (const vertexId of vertexChain) {
+        const [x, y] = vertices.p[vertexId];
+        coordinates.push(toGeoCoordinates(x, y));
+      }
+
+      // Close the ring (first coordinate = last coordinate)
+      if (coordinates.length > 0) {
+        coordinates.push(coordinates[0]);
+      }
+
+      // Only add ring if it has at least 4 positions (minimum for valid LinearRing)
+      if (coordinates.length >= 4) {
+        rings.push(coordinates);
+      }
+    }
+
+    return rings;
+  }
+
+  // Filter and process zones
+  zones.forEach(zone => {
+    // Exclude hidden zones and zones with no cells
+    if ((zone as { hidden?: boolean }).hidden || !zone.cells || zone.cells.length === 0) return;
+
+    const rings = getZonePolygonCoordinates(zone.cells);
+
+    // Skip if no valid rings were generated
+    if (rings.length === 0) return;
+
+    const properties = {
+      id: zone.i,
+      name: zone.name,
+      type: zone.type,
+      color: zone.color,
+      cells: zone.cells
+    };
+
+    // If there's only one ring, use Polygon geometry
+    if (rings.length === 1) {
+      const feature = {
+        type: "Feature",
+        geometry: { type: "Polygon", coordinates: rings },
+        properties
+      };
+      json.features.push(feature);
+    } else {
+      // Multiple disconnected components: use MultiPolygon
+      // Each component is wrapped in its own array
+      const multiPolygonCoordinates = rings.map(ring => [ring]);
+      const feature = {
+        type: "Feature",
+        geometry: { type: "MultiPolygon", coordinates: multiPolygonCoordinates },
+        properties
+      };
+      json.features.push(feature);
+    }
+  });
+
+  const fileName = `${getFileName("Zones")}.geojson`;
+  downloadFile(JSON.stringify(json), fileName, "application/json");
+}
+
+// reached lazily via Services.ExportMap
+declare global {
+  interface Window {
+    JSZip: any; // registered on demand by libs/jszip.min.js (see exportToPngTiles)
+  }
+}
+
+export const ExportMap = {
+  exportToSvg,
+  exportToPng,
+  exportToJpeg,
+  exportToPngTiles,
+  getMapURL,
+  getRegionImage,
+  saveGeoJsonCells,
+  saveGeoJsonRoutes,
+  saveGeoJsonRivers,
+  saveGeoJsonMarkers,
+  saveGeoJsonZones
+};
