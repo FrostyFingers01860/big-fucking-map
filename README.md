@@ -33,10 +33,6 @@ See [github-download/README.md](github-download/README.md) for details and troub
 
 Districts includes its persistent `world.bin`, earlier `world-v*.bin` snapshots, terrain cell data, terrain image and all 33,574 generated station-town layouts. The original high-resolution Fantasy Map Generator world is included as `data/source/Maptest1.json.zip`. Generated tile caches are omitted and rebuild automatically.
 
-## Licenses and upstream projects
-
-This is an aggregate repository: each component retains its own license. Fantasy Map Generator is MIT-licensed. TownGeneratorOS and the included modified build are GPL-3.0 licensed, with corresponding source included. No new license is asserted over the original Districts component. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and `licenses/`.
-
 ## Removing the bundle
 
 `github-download/Purge.exe` permanently removes only the extracted bundle containing the repository marker. It has no folder picker, refuses unsafe/unmarked locations, requires a checkbox, and asks for confirmation again. Back up maps or other files saved inside the bundle before using it.
