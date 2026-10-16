@@ -64,6 +64,8 @@ final class FirstPerson {
     private static final double RUN = 2.5;
     private static final double MIN_FLY_SPEED = 5.0;
     private static final double MAX_FLY_SPEED = 500_000.0;
+    private static final double MIN_MINIMAP_ZOOM = 0.01;
+    private static final double MAX_MINIMAP_ZOOM = 64.0;
 
     private final MapPanel map;
     private final View3D view;
@@ -78,6 +80,8 @@ final class FirstPerson {
     private double verticalSpeed; // world units per second
     private double yaw;
     private double pitch;         // radians; 0 is level
+    /** Independent scale for the first-person 2D minimap. */
+    private double minimapZoom = 1.0;
     private boolean onGround;
     private boolean forward, back, left, right, jump, descend, run;
     private Timer timer;
@@ -99,6 +103,14 @@ final class FirstPerson {
     void onChange(Runnable listener) { this.changed = listener; }
 
     boolean active() { return active; }
+
+    double minimapX() { return x; }
+
+    double minimapY() { return y; }
+
+    double minimapHeading() { return yaw; }
+
+    double minimapZoom() { return minimapZoom; }
 
     // ------------------------------------------------------------------ entering and leaving
 
@@ -178,6 +190,12 @@ final class FirstPerson {
             case KeyEvent.VK_SPACE -> jump = down;
             case KeyEvent.VK_CONTROL -> descend = down;
             case KeyEvent.VK_SHIFT -> run = down;
+            case KeyEvent.VK_EQUALS, KeyEvent.VK_ADD -> {
+                if (down) changeMinimapZoom(1.35);
+            }
+            case KeyEvent.VK_MINUS, KeyEvent.VK_SUBTRACT -> {
+                if (down) changeMinimapZoom(1.0 / 1.35);
+            }
             case KeyEvent.VK_F -> {
                 // Toggle on release so key-repeat cannot switch flight on and off rapidly.
                 if (!down) {
@@ -196,6 +214,12 @@ final class FirstPerson {
             }
         }
         return true;
+    }
+
+    private void changeMinimapZoom(double factor) {
+        minimapZoom = Math.max(MIN_MINIMAP_ZOOM, Math.min(MAX_MINIMAP_ZOOM, minimapZoom * factor));
+        map.invalidateFirstPersonMinimap();
+        map.repaint();
     }
 
     /** Mouse look: every movement turns the view, then the pointer is put back in the middle. */
@@ -454,8 +478,8 @@ final class FirstPerson {
         g.drawLine(cx - 8, cy, cx + 8, cy);
         g.drawLine(cx, cy - 8, cx, cy + 8);
         String help = settings.flyMode
-                ? "FLY  •  WASD move  •  Space rise  •  Ctrl descend  •  Shift boost  •  F walk  •  Esc exit"
-                : "First person  •  WASD move  •  Shift run  •  Space jump  •  F fly  •  Esc exit";
+                ? "FLY  •  WASD move  •  Space rise  •  Ctrl descend  •  Shift boost  •  F walk  •  =/- map  •  Esc exit"
+                : "First person  •  WASD move  •  Shift run  •  Space jump  •  F fly  •  =/- map  •  Esc exit";
         g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 12));
         int textWidth = g.getFontMetrics().stringWidth(help);
         g.setColor(new Color(13, 17, 23, 190));

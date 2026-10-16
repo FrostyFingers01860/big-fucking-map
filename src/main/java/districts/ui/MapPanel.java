@@ -23,6 +23,7 @@ import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.event.MouseMotionAdapter;
 import java.awt.event.MouseWheelEvent;
+import java.awt.geom.AffineTransform;
 import java.awt.geom.Ellipse2D;
 import java.awt.geom.Path2D;
 import java.awt.geom.Point2D;
@@ -94,6 +95,16 @@ public final class MapPanel extends JPanel {
     /** The 3D towns drawn in the last frame, which the first-person walker collides with. */
     private List<TownMeshes.Mesh> lastTownMeshes = List.of();
     private FirstPerson firstPerson;
+    /** North-up 2D map cached under the rotating first-person minimap frame. */
+    private BufferedImage firstPersonMinimap;
+    private int firstPersonMinimapSize;
+    private double firstPersonMinimapX = Double.NaN;
+    private double firstPersonMinimapY = Double.NaN;
+    private double firstPersonMinimapZoom = Double.NaN;
+    private long firstPersonMinimapMillis;
+    private boolean firstPersonMinimapDirty = true;
+    private static final double MINIMAP_PIXELS_PER_WORLD = 2_000.0;
+    private static final long MINIMAP_REDRAW_MILLIS = 250L;
     /** Most towns given 3D houses at once (the nearest ones). */
     private static final int MAX_3D_TOWNS = 24;
     /** First-person marker ranges: small towns declutter first, while cities and capitals remain landmarks. */
@@ -295,6 +306,9 @@ public final class MapPanel extends JPanel {
 
     public void showFirstPersonSettings() { firstPerson.showSettings(this); }
 
+    /** Rebuilds the cached 2D map on the next first-person frame. */
+    void invalidateFirstPersonMinimap() { firstPersonMinimapDirty = true; }
+
     List<TownMeshes.Mesh> townMeshesInView() { return lastTownMeshes; }
 
     /** Moves the view's target (in first person, the walker's position) without changing the zoom. */
@@ -309,6 +323,7 @@ public final class MapPanel extends JPanel {
     /** Called when terrain tiles or town images arrive: the 3D view's map texture must be redrawn. */
     private void layerChanged() {
         view3d.textureDirty = true;
+        firstPersonMinimapDirty = true;
         repaint();
     }
 
@@ -343,6 +358,7 @@ public final class MapPanel extends JPanel {
             case TICKET_ROUTE -> showTicketRoute = visible;
             case ROUTE_FOCUS -> focusTicketRoute = visible;
         }
+        firstPersonMinimapDirty = true;
         repaint();
     }
 
@@ -352,6 +368,7 @@ public final class MapPanel extends JPanel {
 
     public void setTicket(TicketPlanner.Ticket ticket) {
         this.ticket = ticket;
+        firstPersonMinimapDirty = true;
         repaint();
     }
 
@@ -493,8 +510,143 @@ public final class MapPanel extends JPanel {
         double regionAlpha = smoothstep(1.25, 3.1, zoom);
         double stationAlpha = smoothstep(6.0, 10.5, zoom);
         drawOverlay(g, regionAlpha, stationAlpha);
+        drawFirstPersonMinimap(g, width, height);
         firstPerson.drawHud(g, width, height);
         drawFps(g);
+    }
+
+    /**
+     * Rotating first-person minimap. The cached image is drawn by the normal 2D layer pipeline, so
+     * terrain, districts, transport, regions and stations match the main map and its filters. Only
+     * the cheap image rotation is done every frame; the map itself is refreshed at most four times a
+     * second while moving, preserving the first-person frame-rate target.
+     */
+    private void drawFirstPersonMinimap(Graphics2D g, int width, int height) {
+        if (!firstPerson.active()) return;
+        int size = Math.min(276, Math.max(160, Math.min(width, height) / 3));
+        double mapZoom = firstPerson.minimapZoom();
+        double pixelsPerWorld = MINIMAP_PIXELS_PER_WORLD * mapZoom;
+        double playerX = firstPerson.minimapX();
+        double playerY = firstPerson.minimapY();
+        long now = System.currentTimeMillis();
+        boolean moved = Double.isNaN(firstPersonMinimapX)
+                || Math.hypot(playerX - firstPersonMinimapX, playerY - firstPersonMinimapY) * pixelsPerWorld >= 1.0;
+        boolean scaleChanged = firstPersonMinimapSize != size
+                || Double.compare(firstPersonMinimapZoom, mapZoom) != 0;
+        if (firstPersonMinimap == null || firstPersonMinimapDirty || scaleChanged
+                || moved && now - firstPersonMinimapMillis >= MINIMAP_REDRAW_MILLIS) {
+            // Clear before rendering so an asynchronous terrain/town tile arriving during the draw
+            // can set it back to true instead of having its refresh accidentally erased afterward.
+            firstPersonMinimapDirty = false;
+            renderFirstPersonMinimap(size, pixelsPerWorld, playerX, playerY);
+            firstPersonMinimapSize = size;
+            firstPersonMinimapX = playerX;
+            firstPersonMinimapY = playerY;
+            firstPersonMinimapZoom = mapZoom;
+            firstPersonMinimapMillis = now;
+        }
+
+        int left = width - size - 18;
+        int top = height - size - 18;
+        double centerX = left + size / 2.0;
+        double centerY = top + size / 2.0;
+        Ellipse2D.Double circle = new Ellipse2D.Double(left, top, size, size);
+
+        g.setColor(new Color(0, 0, 0, 115));
+        g.fill(new Ellipse2D.Double(left - 5, top + 4, size + 10, size + 10));
+        Graphics2D mapGraphics = (Graphics2D) g.create();
+        try {
+            mapGraphics.clip(circle);
+            mapGraphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
+                    RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            AffineTransform transform = new AffineTransform();
+            transform.translate(centerX, centerY);
+            transform.rotate(-firstPerson.minimapHeading());
+            transform.translate(-size / 2.0, -size / 2.0);
+            mapGraphics.drawImage(firstPersonMinimap, transform, null);
+            mapGraphics.setColor(new Color(255, 255, 255, 34));
+            mapGraphics.drawLine(left, (int) centerY, left + size, (int) centerY);
+            mapGraphics.drawLine((int) centerX, top, (int) centerX, top + size);
+        } finally {
+            mapGraphics.dispose();
+        }
+
+        g.setStroke(new BasicStroke(4f));
+        g.setColor(new Color(9, 14, 20, 230));
+        g.draw(circle);
+        g.setStroke(new BasicStroke(1.5f));
+        g.setColor(new Color(203, 218, 226, 210));
+        g.draw(new Ellipse2D.Double(left + 3, top + 3, size - 6, size - 6));
+
+        // The player always points toward the top; the 2D map turns underneath them.
+        Path2D.Double arrow = new Path2D.Double();
+        arrow.moveTo(centerX, centerY - 13);
+        arrow.lineTo(centerX - 8, centerY + 10);
+        arrow.lineTo(centerX, centerY + 5);
+        arrow.lineTo(centerX + 8, centerY + 10);
+        arrow.closePath();
+        g.setColor(new Color(0, 0, 0, 180));
+        AffineTransform shadow = AffineTransform.getTranslateInstance(1.5, 2.0);
+        g.fill(shadow.createTransformedShape(arrow));
+        g.setColor(new Color(245, 250, 252));
+        g.fill(arrow);
+        g.setColor(new Color(35, 190, 235));
+        g.draw(arrow);
+
+        double heading = firstPerson.minimapHeading();
+        double northRadius = size / 2.0 - 17.0;
+        int northX = (int) Math.round(centerX - Math.sin(heading) * northRadius);
+        int northY = (int) Math.round(centerY - Math.cos(heading) * northRadius);
+        g.setFont(getFont().deriveFont(Font.BOLD, 11f));
+        g.setColor(new Color(7, 12, 17, 210));
+        g.fillOval(northX - 9, northY - 9, 18, 18);
+        g.setColor(new Color(255, 116, 106));
+        g.drawString("N", northX - 4, northY + 4);
+
+        String hint = String.format(Locale.ROOT, "Map ×%.2f   = in   - out", mapZoom);
+        g.setFont(getFont().deriveFont(Font.PLAIN, 11f));
+        FontMetrics metrics = g.getFontMetrics();
+        int hintWidth = metrics.stringWidth(hint) + 14;
+        int hintX = (int) Math.round(centerX - hintWidth / 2.0);
+        int hintY = top + size - 28;
+        g.setColor(new Color(7, 12, 17, 205));
+        g.fillRoundRect(hintX, hintY, hintWidth, 20, 8, 8);
+        g.setColor(new Color(230, 238, 242));
+        g.drawString(hint, hintX + 7, hintY + 14);
+    }
+
+    /** Draws a north-up snapshot with the regular 2D renderer, centred on the player. */
+    private void renderFirstPersonMinimap(int size, double pixelsPerWorld, double playerX, double playerY) {
+        BufferedImage image = new BufferedImage(size, size, BufferedImage.TYPE_INT_RGB);
+        Graphics2D mini = image.createGraphics();
+        double savedZoom = zoom;
+        double savedPanX = panX;
+        double savedPanY = panY;
+        int savedWidth = overrideWidth;
+        int savedHeight = overrideHeight;
+        Pass savedPass = pass;
+        try {
+            overrideWidth = size;
+            overrideHeight = size;
+            pass = Pass.NORMAL;
+            zoom = pixelsPerWorld / baseScale();
+            panX = -(playerX - 4.0) * pixelsPerWorld;
+            panY = -(playerY - 4.0) * pixelsPerWorld;
+            mini.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            mini.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+            mini.setPaint(new GradientPaint(0, 0, BACKGROUND_TOP, 0, size, BACKGROUND_BOTTOM));
+            mini.fillRect(0, 0, size, size);
+            drawLayers(mini, true);
+        } finally {
+            mini.dispose();
+            zoom = savedZoom;
+            panX = savedPanX;
+            panY = savedPanY;
+            overrideWidth = savedWidth;
+            overrideHeight = savedHeight;
+            pass = savedPass;
+        }
+        firstPersonMinimap = image;
     }
 
     /**
